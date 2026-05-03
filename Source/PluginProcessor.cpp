@@ -85,6 +85,11 @@ XSamplerAudioProcessor::XSamplerAudioProcessor()
       apvts (*this, nullptr, "XSamplerState", createLayout())
 {
     synth = std::make_unique<sfz::Sfizz>();
+    // Set sane defaults BEFORE any samples are configured. Voice count
+    // allocation must happen on a non-audio thread; we re-do it from
+    // prepareToPlay once block size / sample rate are known.
+    synth->setSampleRate (44100.0f);
+    synth->setSamplesPerBlock (512);
 
     pMasterGain        = apvts.getRawParameterValue (ParamID::masterGain);
     pTuneGlobal        = apvts.getRawParameterValue (ParamID::tuneGlobal);
@@ -118,8 +123,9 @@ XSamplerAudioProcessor::XSamplerAudioProcessor()
     pVelToVolume       = apvts.getRawParameterValue (ParamID::velToVolume);
     pVelToFilter       = apvts.getRawParameterValue (ParamID::velToFilter);
 
-    // Reserve a sane default voice count; will be reconfigured in prepareToPlay.
+    // Reserve a sane default voice count on a non-audio thread.
     synth->setNumVoices (32);
+    lastNumVoices = 32;
 }
 
 XSamplerAudioProcessor::~XSamplerAudioProcessor() = default;
@@ -132,6 +138,15 @@ void XSamplerAudioProcessor::prepareToPlay (double sampleRate, int samplesPerBlo
     const juce::ScopedLock sl (synthLock);
     synth->setSampleRate (static_cast<float> (sampleRate));
     synth->setSamplesPerBlock (samplesPerBlock);
+
+    // Configure voice count here (host thread) so the audio thread never has
+    // to allocate. Match the current voice_mode parameter.
+    const bool mono = pVoiceMode != nullptr && pVoiceMode->load() >= 0.5f;
+    const int target = mono ? 1 : 32;
+    synth->setNumVoices (target);
+    lastNumVoices = target;
+
+    keyboardState.reset();
 }
 
 void XSamplerAudioProcessor::releaseResources() {}
@@ -164,10 +179,11 @@ juce::File XSamplerAudioProcessor::getCurrentSfzFile() const
 
 void XSamplerAudioProcessor::applyParametersToSfizz()
 {
-    // Voice count: 1 if mono, else 32. (sfizz handles mono via SFZ opcodes; we
-    // approximate by limiting voice count when mono is requested.)
-    const bool mono = pVoiceMode->load() >= 0.5f;
-    synth->setNumVoices (mono ? 1 : 32);
+    // NOTE: setNumVoices is NOT real-time safe (reallocates internal buffers).
+    // It is only ever called from prepareToPlay / loadSfzFile / constructor.
+    // Voice-mode parameter changes therefore take effect on the next
+    // prepareToPlay() — which the host calls when the transport changes
+    // sample rate / block size, or when the plugin is re-instantiated.
 
     // TODO: pitchbend_range — sfizz reads bend_up/bend_down from the SFZ file.
     //       Apply via a runtime SFZ override or scale pitchwheel ourselves.
@@ -204,6 +220,9 @@ void XSamplerAudioProcessor::processBlock (juce::AudioBuffer<float>& buffer,
     const int numSamples = buffer.getNumSamples();
 
     buffer.clear();
+
+    // Inject any MIDI coming from the on-screen keyboard.
+    keyboardState.processNextMidiBuffer (midi, 0, numSamples, true);
 
     if (! sfzLoaded.load (std::memory_order_acquire))
     {
@@ -259,7 +278,10 @@ void XSamplerAudioProcessor::processBlock (juce::AudioBuffer<float>& buffer,
     midi.clear();
 
     float* outs[2] = { buffer.getWritePointer (0), buffer.getWritePointer (1) };
-    synth->renderBlock (outs, static_cast<size_t> (numSamples), 2);
+    // sfizz's API counts STEREO PAIRS, not channels — pass 1 for a single
+    // stereo bus. Passing 2 reads out-of-bounds pointers from `outs[]` and
+    // crashes inside Synth::renderBlock at the initial buffer.fill(0).
+    synth->renderBlock (outs, static_cast<size_t> (numSamples), 1);
 
     const float gain = pMasterGain->load();
     buffer.applyGain (gain);

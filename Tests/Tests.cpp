@@ -36,7 +36,7 @@ namespace
 //==============================================================================
 struct ParameterTests : public juce::UnitTest
 {
-    ParameterTests() : juce::UnitTest ("Parameters") {}
+    ParameterTests() : juce::UnitTest ("Parameters", "XSampler") {}
 
     void runTest() override
     {
@@ -94,7 +94,7 @@ struct ParameterTests : public juce::UnitTest
 //==============================================================================
 struct BusLayoutTests : public juce::UnitTest
 {
-    BusLayoutTests() : juce::UnitTest ("Bus layout") {}
+    BusLayoutTests() : juce::UnitTest ("Bus layout", "XSampler") {}
 
     void runTest() override
     {
@@ -120,7 +120,7 @@ struct BusLayoutTests : public juce::UnitTest
 //==============================================================================
 struct SilenceTests : public juce::UnitTest
 {
-    SilenceTests() : juce::UnitTest ("Silence without SFZ") {}
+    SilenceTests() : juce::UnitTest ("Silence without SFZ", "XSampler") {}
 
     void runTest() override
     {
@@ -146,7 +146,7 @@ struct SilenceTests : public juce::UnitTest
 //==============================================================================
 struct StereoWidthTests : public juce::UnitTest
 {
-    StereoWidthTests() : juce::UnitTest ("Stereo width post-processing") {}
+    StereoWidthTests() : juce::UnitTest ("Stereo width post-processing", "XSampler") {}
 
     static void runWidthBlock (XSamplerAudioProcessor& p,
                                juce::AudioBuffer<float>& buf,
@@ -197,7 +197,7 @@ struct StereoWidthTests : public juce::UnitTest
 //==============================================================================
 struct StateRoundTripTests : public juce::UnitTest
 {
-    StateRoundTripTests() : juce::UnitTest ("State save / restore") {}
+    StateRoundTripTests() : juce::UnitTest ("State save / restore", "XSampler") {}
 
     void runTest() override
     {
@@ -227,7 +227,7 @@ struct StateRoundTripTests : public juce::UnitTest
 //==============================================================================
 struct LoadSfzTests : public juce::UnitTest
 {
-    LoadSfzTests() : juce::UnitTest ("SFZ loading") {}
+    LoadSfzTests() : juce::UnitTest ("SFZ loading", "XSampler") {}
 
     void runTest() override
     {
@@ -252,7 +252,7 @@ struct LoadSfzTests : public juce::UnitTest
 //==============================================================================
 struct RenderTests : public juce::UnitTest
 {
-    RenderTests() : juce::UnitTest ("Rendering with SFZ") {}
+    RenderTests() : juce::UnitTest ("Rendering with SFZ", "XSampler") {}
 
     void runTest() override
     {
@@ -305,7 +305,7 @@ struct RenderTests : public juce::UnitTest
 //==============================================================================
 struct MidiHandlingTests : public juce::UnitTest
 {
-    MidiHandlingTests() : juce::UnitTest ("MIDI handling") {}
+    MidiHandlingTests() : juce::UnitTest ("MIDI handling", "XSampler") {}
 
     void runTest() override
     {
@@ -344,9 +344,81 @@ struct MidiHandlingTests : public juce::UnitTest
 };
 
 //==============================================================================
+struct RealSfzSmokeTest : public juce::UnitTest
+{
+    RealSfzSmokeTest() : juce::UnitTest ("Real SFZ smoke (Resonant2)", "XSampler") {}
+
+    void runTest() override
+    {
+        const juce::File sfz (
+            "/Users/capitalsound/Library/Mobile Documents/com~apple~CloudDocs/Code/XSampler/SFZ/Resonant2.sfz");
+
+        beginTest ("Resonant2.sfz file exists");
+        if (! sfz.existsAsFile())
+        {
+            logMessage ("SKIPPING — SFZ not present at expected path");
+            return;
+        }
+
+        beginTest ("Plugin loads Resonant2.sfz");
+        auto p = makePrepared();
+        const bool loaded = p->loadSfzFile (sfz);
+        expect (loaded, "Resonant2.sfz failed to load");
+        if (! loaded) return;
+
+        beginTest ("noteOn produces non-silent finite audio (no crash)");
+        juce::AudioBuffer<float> buf (2, kBlock);
+        juce::MidiBuffer midi;
+        midi.addEvent (juce::MidiMessage::noteOn (1, 60, (juce::uint8) 100), 0);
+
+        // Render up to 2 seconds at 48k → ~375 blocks of 256 samples.
+        // Streaming samplers may buffer for the first few blocks before audio
+        // appears; allow ample time.
+        bool foundSignal = false;
+        float peak = 0.0f;
+        const int maxBlocks = 400;
+        for (int b = 0; b < maxBlocks; ++b)
+        {
+            buf.clear();
+            p->processBlock (buf, midi);
+            midi.clear();
+
+            for (int ch = 0; ch < buf.getNumChannels(); ++ch)
+            {
+                auto* d = buf.getReadPointer (ch);
+                for (int i = 0; i < buf.getNumSamples(); ++i)
+                {
+                    expect (std::isfinite (d[i]), "Non-finite sample in render");
+                    peak = std::max (peak, std::abs (d[i]));
+                    if (peak > 1.0e-4f) foundSignal = true;
+                }
+            }
+            if (foundSignal && b > 20) break;
+        }
+        logMessage ("Peak amplitude observed: " + juce::String (peak, 6));
+        expect (foundSignal, "No audible output from Resonant2.sfz after 400 blocks");
+
+        beginTest ("Voice-mode toggle does not crash mid-render");
+        if (auto* prm = p->apvts.getParameter ("voice_mode"))
+        {
+            // Toggle several times across blocks — replicates the original
+            // crash repro where setNumVoices hit the audio thread every block.
+            for (int b = 0; b < 32; ++b)
+            {
+                prm->setValueNotifyingHost (b & 1 ? 1.0f : 0.0f);
+                buf.clear();
+                juce::MidiBuffer empty;
+                p->processBlock (buf, empty);
+            }
+            expect (true, "Survived rapid voice-mode toggles");
+        }
+    }
+};
+
+//==============================================================================
 struct EditorTests : public juce::UnitTest
 {
-    EditorTests() : juce::UnitTest ("Editor lifecycle") {}
+    EditorTests() : juce::UnitTest ("Editor lifecycle", "XSampler") {}
 
     void runTest() override
     {
@@ -354,8 +426,8 @@ struct EditorTests : public juce::UnitTest
         auto p = makePrepared();
         std::unique_ptr<juce::AudioProcessorEditor> ed (p->createEditor());
         expect (ed != nullptr);
-        expectEquals (ed->getWidth(),  520);
-        expectEquals (ed->getHeight(), 800);
+        expectEquals (ed->getWidth(),  560);
+        expectEquals (ed->getHeight(), 880);
     }
 };
 
@@ -369,6 +441,7 @@ static StateRoundTripTests  _t_state;
 static LoadSfzTests         _t_load;
 static RenderTests          _t_render;
 static MidiHandlingTests    _t_midi;
+static RealSfzSmokeTest     _t_real_sfz;
 static EditorTests          _t_editor;
 
 int main (int, char**)
@@ -376,7 +449,7 @@ int main (int, char**)
     juce::ScopedJuceInitialiser_GUI juceInit;
     juce::UnitTestRunner runner;
     runner.setAssertOnFailure (false);
-    runner.runAllTests();
+    runner.runTestsInCategory ("XSampler");
 
     int failures = 0, total = 0;
     for (int i = 0; i < runner.getNumResults(); ++i)

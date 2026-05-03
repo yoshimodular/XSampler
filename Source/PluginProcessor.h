@@ -52,6 +52,11 @@ private:
     std::atomic<bool> sfzLoaded { false };
     juce::File currentSfzFile;
 
+    int lastNumVoices { -1 };
+
+public:
+    juce::MidiKeyboardState keyboardState;
+
     double currentSampleRate { 44100.0 };
     int    currentBlockSize  { 512 };
 

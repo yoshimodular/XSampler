@@ -3,6 +3,7 @@
 XSamplerAudioProcessorEditor::XSamplerAudioProcessorEditor (XSamplerAudioProcessor& p)
     : juce::AudioProcessorEditor (&p),
       processor (p),
+      keyboard (p.keyboardState, juce::MidiKeyboardComponent::horizontalKeyboard),
       genericEditor (p)
 {
     pathLabel.setJustificationType (juce::Justification::centredLeft);
@@ -14,10 +15,16 @@ XSamplerAudioProcessorEditor::XSamplerAudioProcessorEditor (XSamplerAudioProcess
     loadButton.onClick = [this] { chooseSfzFile(); };
     addAndMakeVisible (loadButton);
 
+    keyboard.setLowestVisibleKey (36);   // C2
+    keyboard.setKeyWidth (18.0f);
+    keyboard.setAvailableRange (0, 127);
+    keyboard.setVelocity (0.8f, true);
+    addAndMakeVisible (keyboard);
+
     addAndMakeVisible (genericEditor);
 
     updatePathLabel();
-    setSize (520, 800);
+    setSize (560, 880);
 }
 
 XSamplerAudioProcessorEditor::~XSamplerAudioProcessorEditor() = default;
@@ -35,6 +42,9 @@ void XSamplerAudioProcessorEditor::resized()
     loadButton.setBounds (top.removeFromRight (110));
     top.removeFromRight (8);
     pathLabel.setBounds (top);
+
+    area.removeFromTop (8);
+    keyboard.setBounds (area.removeFromTop (90));
 
     area.removeFromTop (8);
     genericEditor.setBounds (area);
