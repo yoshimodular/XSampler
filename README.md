@@ -2,7 +2,7 @@
 
 An SFZ-powered sampler plugin for macOS. Built with **JUCE 8** and the **sfizz** SFZ engine. Targets VST3, AU, and Standalone on Apple Silicon.
 
-> **Status:** Alpha 1 skeleton. Audio engine works (load any `.sfz`, play notes, pitchbend, CCs). Most macro parameters are wired in the UI but not yet routed to per-region SFZ overrides — see [Parameter status](#parameter-status).
+> **Status:** Alpha 0.0.3. Audio engine works (load any `.sfz`, play notes, pitchbend, CCs). All overlay parameters are wired through a runtime SFZ override layer (`<global>` opcodes injected on top of the loaded file, with per-region conflicts stripped). Includes a built-in arpeggiator.
 
 ---
 
@@ -131,28 +131,48 @@ XSampler/
 
 ## Parameter status
 
-All 31 parameters in the spec are declared in the APVTS and persist in state. Wiring to the sfizz engine is staged:
+All 31 macro parameters + 6 arp parameters are wired and verified by unit tests:
 
-| Parameter | Status |
-|---|---|
-| `master_gain` | ✅ applied post-render |
-| `octave_transpose` | ✅ applied to MIDI note numbers |
-| `pitchbend_range` | ✅ pitchwheel scaled by ratio to SFZ default |
-| `voice_mode` (poly/mono) | ✅ approximated via `setNumVoices(1)` when mono |
-| `output_width` | ✅ M/S matrix post-render |
-| `tune_global` (cents) | ⏳ TODO — needs runtime SFZ override |
-| `start_offset` | ⏳ TODO — needs `offset` opcode override |
-| `analog_amount` | ⏳ TODO — `tune_random` + `offset_random` injection |
-| `doubler_enabled` | ⏳ TODO — second voice hard L/R |
-| `legato_enabled`, `portamento_*`, `fingered_portamento` | ⏳ TODO |
-| `filter_type`, `filter_cutoff`, `filter_resonance` | ⏳ TODO |
-| Volume + filter ADSR (8 params) | ⏳ TODO |
-| LFO (6 params) | ⏳ TODO |
-| `velocity_to_volume`, `velocity_to_filter` | ⏳ TODO |
+| Parameter | Status | How |
+|---|---|---|
+| `master_gain` | ✅ | post-render gain |
+| `octave_transpose` | ✅ | applied to MIDI note numbers |
+| `pitchbend_range` | ✅ | pitchwheel scaled |
+| `voice_mode` (poly/mono) | ✅ | `polyphony=1` overlay + voice count |
+| `output_width` | ✅ | post-render M/S matrix |
+| `tune_global` cents | ✅ | overlay `tune=` |
+| `analog_amount` | ✅ | overlay `pitch_random` + `delay_random` |
+| `filter_type / cutoff / resonance` | ✅ | overlay `fil_type / cutoff / resonance` |
+| Volume ADSR (4) | ✅ | overlay `ampeg_*` |
+| Filter ADSR (4) | ✅ | overlay `fileg_*` (depth=2400 c) |
+| LFO 1 (6 params) | ✅ | overlay `lfo01_freq / wave / delay / pitch|cutoff|volume` |
+| `velocity_to_volume`, `velocity_to_filter` | ✅ | overlay `amp_veltrack / fil_veltrack` |
+| `arp_enabled / hold / mode / rate / octaves / gate` | ✅ | host-side MIDI engine |
+| `start_offset` | ⏳ | needs per-region inspection (`offset` is sample-frame-based) |
+| `doubler_enabled` | ⏳ | needs duplicated-region injection |
+| `legato_enabled`, `portamento_*`, `fingered_portamento` | ⏳ | sfizz 1.2.3 lacks a clean SFZ-level expression |
 
-✅ = audible / verified · ⏳ = exposed in state but not yet routed (engine plays the SFZ as authored).
+### How the overlay works
 
-The "TODO" group all require either runtime `<region>` overlays generated on top of the loaded SFZ, or sfizz's experimental override API. They are next on the roadmap.
+When any overlay parameter changes, an `AudioProcessorValueTreeState::Listener` flags the SFZ as dirty. A `Timer` running at 20 Hz on the message thread waits ~80 ms for the user to settle, then:
+
+1. Loads the original `.sfz` source as text.
+2. Strips conflicting opcodes from regions/groups (`cutoff=`, `ampeg_*=`, `lfoNN_*=`, etc.) so per-region values can't shadow our globals.
+3. Prepends a synthesised `<global>` block built from the current parameter values.
+4. Calls `sfz::Sfizz::loadSfzString()` under the synth lock — sfizz re-parses the SFZ but **keeps the decoded sample cache** by absolute path, so the reload is fast.
+
+### Arpeggiator
+
+| Knob | Range | Default |
+|---|---|---|
+| `arp_enabled` | bool | off |
+| `arp_hold` | bool | off |
+| `arp_mode` | Up · Down · UpDown · Random · AsPlayed | Up |
+| `arp_rate` | 1/4 · 1/8 · 1/8T · 1/16 · 1/16T · 1/32 | 1/16 |
+| `arp_octaves` | 1–4 | 1 |
+| `arp_gate` | 0.05–1.0 | 0.5 |
+
+BPM is taken from the host playhead (falls back to 120 BPM when running standalone). Hold latches the held set when all keys are released; a fresh keypress wipes the latch and starts a new phrase.
 
 ---
 

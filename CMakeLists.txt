@@ -6,7 +6,7 @@ set(CMAKE_XCODE_ATTRIBUTE_CODE_SIGNING_REQUIRED "NO")
 set(CMAKE_XCODE_ATTRIBUTE_CODE_SIGN_IDENTITY "")
 set(CMAKE_XCODE_ATTRIBUTE_CODE_SIGNING_ALLOWED "NO")
 
-project(XSampler VERSION 0.0.2 LANGUAGES C CXX)
+project(XSampler VERSION 0.0.3 LANGUAGES C CXX)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -74,6 +74,10 @@ target_sources(XSampler PRIVATE
     Source/PluginProcessor.h
     Source/PluginEditor.cpp
     Source/PluginEditor.h
+    Source/SfzOverride.cpp
+    Source/SfzOverride.h
+    Source/Arpeggiator.cpp
+    Source/Arpeggiator.h
 )
 
 target_compile_definitions(XSampler PUBLIC

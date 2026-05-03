@@ -7,6 +7,8 @@
 #include "../Source/PluginProcessor.cpp"
 #include "../Source/PluginEditor.h"
 #include "../Source/PluginEditor.cpp"
+#include "../Source/SfzOverride.cpp"
+#include "../Source/Arpeggiator.cpp"
 
 #include <cmath>
 
@@ -416,6 +418,265 @@ struct RealSfzSmokeTest : public juce::UnitTest
 };
 
 //==============================================================================
+namespace
+{
+    // Render a fixed number of blocks holding note 60, returning the buffer
+    // that contains roughly 200 ms of audio after the attack.
+    juce::AudioBuffer<float> renderHeldNote (XSamplerAudioProcessor& p,
+                                             int note,
+                                             int blocks,
+                                             juce::uint8 vel = 100)
+    {
+        // Tests change params and immediately render — bypass the timer
+        // throttle that fires on the (idle) message thread.
+        p.flushOverlayNow();
+
+        juce::AudioBuffer<float> total (2, blocks * kBlock);
+        total.clear();
+
+        juce::AudioBuffer<float> blk (2, kBlock);
+        juce::MidiBuffer midi;
+        midi.addEvent (juce::MidiMessage::noteOn (1, note, vel), 0);
+
+        for (int b = 0; b < blocks; ++b)
+        {
+            blk.clear();
+            p.processBlock (blk, midi);
+            midi.clear();
+            for (int ch = 0; ch < 2; ++ch)
+                total.copyFrom (ch, b * kBlock, blk, ch, 0, kBlock);
+        }
+        return total;
+    }
+
+    float bufferRMS (const juce::AudioBuffer<float>& b, int from = 0, int len = -1)
+    {
+        if (len < 0) len = b.getNumSamples() - from;
+        double sum = 0.0;
+        const int N = b.getNumChannels() * len;
+        for (int ch = 0; ch < b.getNumChannels(); ++ch)
+        {
+            auto* d = b.getReadPointer (ch);
+            for (int i = from; i < from + len; ++i)
+                sum += d[i] * d[i];
+        }
+        return std::sqrt ((float) (sum / juce::jmax (1, N)));
+    }
+
+    // High-frequency RMS via simple difference (proxy for spectral content
+    // above ~Nyquist/4). Useful for filter cutoff comparisons.
+    float bufferHighFreqRMS (const juce::AudioBuffer<float>& b)
+    {
+        double sum = 0.0;
+        int N = 0;
+        for (int ch = 0; ch < b.getNumChannels(); ++ch)
+        {
+            auto* d = b.getReadPointer (ch);
+            for (int i = 1; i < b.getNumSamples(); ++i)
+            {
+                const float diff = d[i] - d[i-1];
+                sum += diff * diff;
+                ++N;
+            }
+        }
+        return std::sqrt ((float) (sum / juce::jmax (1, N)));
+    }
+
+    bool loadResonant (XSamplerAudioProcessor& p)
+    {
+        const juce::File sfz (
+            "/Users/capitalsound/Library/Mobile Documents/com~apple~CloudDocs/Code/XSampler/SFZ/Resonant2.sfz");
+        return sfz.existsAsFile() && p.loadSfzFile (sfz);
+    }
+}
+
+//==============================================================================
+struct OverlayParamTests : public juce::UnitTest
+{
+    OverlayParamTests() : juce::UnitTest ("Overlay parameters affect audio", "XSampler") {}
+
+    void runTest() override
+    {
+        auto p = makePrepared();
+        if (! loadResonant (*p))
+        {
+            beginTest ("Resonant2.sfz available");
+            logMessage ("SKIPPING — SFZ not present");
+            return;
+        }
+
+        // ---- Filter cutoff ----------------------------------------------
+        beginTest ("Filter cutoff: low cutoff has less HF energy than high cutoff");
+        p->apvts.getParameter ("filter_type")->setValueNotifyingHost   (0.0f); // LP
+        p->apvts.getParameter ("filter_resonance")->setValueNotifyingHost (0.0f);
+
+        // Open filter
+        p->apvts.getParameter ("filter_cutoff")->setValueNotifyingHost (1.0f); // 20kHz
+        auto open = renderHeldNote (*p, 60, 60);
+        const float openHF = bufferHighFreqRMS (open);
+
+        // Closed filter
+        p->apvts.getParameter ("filter_cutoff")->setValueNotifyingHost (0.0f); // 20Hz
+        auto closed = renderHeldNote (*p, 60, 60);
+        const float closedHF = bufferHighFreqRMS (closed);
+
+        logMessage ("HF RMS  open=" + juce::String (openHF, 6) + "  closed=" + juce::String (closedHF, 6));
+        expect (openHF > closedHF * 1.5f,
+                "Closing the LP filter should reduce high-frequency content");
+
+        // Reset cutoff
+        p->apvts.getParameter ("filter_cutoff")->setValueNotifyingHost (1.0f);
+
+        // ---- Vol Attack -------------------------------------------------
+        beginTest ("Vol Attack: long attack ramps in slowly");
+        p->apvts.getParameter ("vol_attack")->setValueNotifyingHost (0.0f);  // ~1 ms
+        auto fast = renderHeldNote (*p, 60, 12);
+
+        p->apvts.getParameter ("vol_attack")->setValueNotifyingHost (0.5f);  // long
+        auto slow = renderHeldNote (*p, 60, 12);
+
+        // Compare RMS of the first 30 ms.
+        const int firstMs = (int) (kSR * 0.03);
+        const float fastEarly = bufferRMS (fast, 0, firstMs);
+        const float slowEarly = bufferRMS (slow, 0, firstMs);
+        logMessage ("Early RMS  fast-attack=" + juce::String (fastEarly, 6)
+                    + "  slow-attack=" + juce::String (slowEarly, 6));
+        expect (fastEarly > slowEarly * 1.5f,
+                "Slow attack should have lower energy in the first 30 ms than fast attack");
+
+        p->apvts.getParameter ("vol_attack")->setValueNotifyingHost (0.0f);
+
+        // ---- Tune cents -------------------------------------------------
+        beginTest ("Tune cents: changing tune produces a different waveform");
+        auto tune0   = renderHeldNote (*p, 60, 8);
+        p->apvts.getParameter ("tune_global")->setValueNotifyingHost (1.0f); // +100 cents
+        auto tune100 = renderHeldNote (*p, 60, 8);
+
+        // Compute correlation: should differ when tuned.
+        double dot = 0.0, n0 = 0.0, n1 = 0.0;
+        const int N = juce::jmin (tune0.getNumSamples(), tune100.getNumSamples());
+        for (int i = 0; i < N; ++i)
+        {
+            const float a = tune0.getReadPointer (0)[i];
+            const float b = tune100.getReadPointer (0)[i];
+            dot += a * b; n0 += a * a; n1 += b * b;
+        }
+        const double corr = (n0 > 0 && n1 > 0) ? dot / std::sqrt (n0 * n1) : 1.0;
+        logMessage ("Tune correlation 0 vs +100c: " + juce::String (corr, 4));
+        expect (corr < 0.9, "Tuning by +100 cents should noticeably decorrelate the signal");
+        p->apvts.getParameter ("tune_global")->setValueNotifyingHost (0.5f); // back to 0
+    }
+};
+
+//==============================================================================
+struct ArpTests : public juce::UnitTest
+{
+    ArpTests() : juce::UnitTest ("Arpeggiator", "XSampler") {}
+
+    static int countNoteOns (const juce::MidiBuffer& mb)
+    {
+        int n = 0;
+        for (const auto m : mb)
+            if (m.getMessage().isNoteOn()) ++n;
+        return n;
+    }
+
+    void runTest() override
+    {
+        Arpeggiator arp;
+        arp.prepare (kSR);
+        arp.setBpm (120.0);
+        arp.setEnabled (true);
+        arp.setMode (Arpeggiator::Up);
+        arp.setRate (Arpeggiator::Sixteenth);
+        arp.setOctaves (1);
+        arp.setGate (0.5f);
+
+        // Seed three held notes.
+        juce::MidiBuffer in;
+        in.addEvent (juce::MidiMessage::noteOn (1, 60, (juce::uint8) 100), 0);
+        in.addEvent (juce::MidiMessage::noteOn (1, 64, (juce::uint8) 100), 0);
+        in.addEvent (juce::MidiMessage::noteOn (1, 67, (juce::uint8) 100), 0);
+
+        // Render 1 second, count noteOns. At 120 bpm, 1/16 → 8 steps/sec.
+        beginTest ("16th notes at 120 BPM ≈ 8 steps per second");
+        juce::MidiBuffer out;
+        int noteOns = 0;
+        const int totalSamples = (int) kSR;
+        const int steps = totalSamples / kBlock;
+        for (int b = 0; b < steps; ++b)
+        {
+            arp.process (in, out, kBlock);
+            noteOns += countNoteOns (out);
+            in.clear(); // only initial press
+        }
+        logMessage ("noteOns in 1 s: " + juce::String (noteOns));
+        expect (noteOns >= 7 && noteOns <= 9,
+                "Expected ~8 noteOns/s for 1/16 at 120 BPM");
+
+        // Pattern walks Up (60 → 64 → 67 → 60 …).
+        beginTest ("Up mode walks the pattern in ascending order");
+        arp.reset();
+        arp.setEnabled (true);
+        in.clear();
+        in.addEvent (juce::MidiMessage::noteOn (1, 60, (juce::uint8) 100), 0);
+        in.addEvent (juce::MidiMessage::noteOn (1, 64, (juce::uint8) 100), 0);
+        in.addEvent (juce::MidiMessage::noteOn (1, 67, (juce::uint8) 100), 0);
+
+        std::vector<int> emitted;
+        for (int b = 0; b < steps && (int) emitted.size() < 6; ++b)
+        {
+            arp.process (in, out, kBlock);
+            for (const auto m : out)
+                if (m.getMessage().isNoteOn())
+                    emitted.push_back (m.getMessage().getNoteNumber());
+            in.clear();
+        }
+        if (emitted.size() >= 6)
+        {
+            const std::vector<int> expectVec { 60, 64, 67, 60, 64, 67 };
+            for (size_t i = 0; i < 6; ++i)
+                expectEquals (emitted[i], expectVec[i],
+                    "Step " + juce::String ((int) i) + " should be " + juce::String (expectVec[i]));
+        }
+        else
+        {
+            expect (false, "Did not collect 6 noteOns in time");
+        }
+
+        // Hold latches even after key release.
+        beginTest ("Hold latches notes after release");
+        arp.reset();
+        arp.setEnabled (true);
+        arp.setHold (true);
+        in.clear();
+        in.addEvent (juce::MidiMessage::noteOn  (1, 60, (juce::uint8) 100), 0);
+        in.addEvent (juce::MidiMessage::noteOff (1, 60),                    1);
+
+        int held = 0;
+        for (int b = 0; b < 16; ++b)
+        {
+            arp.process (in, out, kBlock);
+            held += countNoteOns (out);
+            in.clear();
+        }
+        expect (held >= 1, "Hold should keep producing noteOns after the key released");
+
+        // Disable → no notes generated, pass-through.
+        beginTest ("Disabled arp passes MIDI through unchanged");
+        arp.setEnabled (false);
+        in.clear();
+        in.addEvent (juce::MidiMessage::noteOn (1, 60, (juce::uint8) 100), 0);
+        arp.process (in, out, kBlock);
+        bool sawTheNote = false;
+        for (const auto m : out)
+            if (m.getMessage().isNoteOn() && m.getMessage().getNoteNumber() == 60)
+                sawTheNote = true;
+        expect (sawTheNote, "Pass-through should preserve the original noteOn");
+    }
+};
+
+//==============================================================================
 struct EditorTests : public juce::UnitTest
 {
     EditorTests() : juce::UnitTest ("Editor lifecycle", "XSampler") {}
@@ -442,6 +703,8 @@ static LoadSfzTests         _t_load;
 static RenderTests          _t_render;
 static MidiHandlingTests    _t_midi;
 static RealSfzSmokeTest     _t_real_sfz;
+static OverlayParamTests    _t_overlay;
+static ArpTests             _t_arp;
 static EditorTests          _t_editor;
 
 int main (int, char**)

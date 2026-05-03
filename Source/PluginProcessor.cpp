@@ -1,5 +1,6 @@
 #include "PluginProcessor.h"
 #include "PluginEditor.h"
+#include "SfzOverride.h"
 
 namespace ParamID
 {
@@ -34,6 +35,32 @@ namespace ParamID
     static constexpr auto outputWidth     = "output_width";
     static constexpr auto velToVolume     = "velocity_to_volume";
     static constexpr auto velToFilter     = "velocity_to_filter";
+
+    static constexpr auto arpEnabled = "arp_enabled";
+    static constexpr auto arpHold    = "arp_hold";
+    static constexpr auto arpMode    = "arp_mode";
+    static constexpr auto arpRate    = "arp_rate";
+    static constexpr auto arpOctaves = "arp_octaves";
+    static constexpr auto arpGate    = "arp_gate";
+}
+
+namespace
+{
+    // Parameters that, when changed, require an SFZ overlay rebuild.
+    const juce::StringArray& overlayParams()
+    {
+        static const juce::StringArray ids {
+            ParamID::tuneGlobal, ParamID::analogAmount,
+            ParamID::filterType, ParamID::filterCutoff, ParamID::filterResonance,
+            ParamID::volAttack, ParamID::volDecay, ParamID::volSustain, ParamID::volRelease,
+            ParamID::filterAttack, ParamID::filterDecay, ParamID::filterSustain, ParamID::filterRelease,
+            ParamID::lfoEnabled, ParamID::lfoWaveform, ParamID::lfoRate, ParamID::lfoDepth,
+            ParamID::lfoDelay, ParamID::lfoTarget,
+            ParamID::velToVolume, ParamID::velToFilter,
+            ParamID::voiceMode
+        };
+        return ids;
+    }
 }
 
 juce::AudioProcessorValueTreeState::ParameterLayout XSamplerAudioProcessor::createLayout()
@@ -77,6 +104,13 @@ juce::AudioProcessorValueTreeState::ParameterLayout XSamplerAudioProcessor::crea
     layout.add (std::make_unique<FloatParam>  (juce::ParameterID { ParamID::velToVolume, 1 },     "Velocity → Volume", juce::NormalisableRange<float> (0.0f, 1.0f),    0.8f));
     layout.add (std::make_unique<FloatParam>  (juce::ParameterID { ParamID::velToFilter, 1 },     "Velocity → Filter", juce::NormalisableRange<float> (0.0f, 1.0f),    0.0f));
 
+    layout.add (std::make_unique<BoolParam>   (juce::ParameterID { ParamID::arpEnabled, 1 }, "Arp",        false));
+    layout.add (std::make_unique<BoolParam>   (juce::ParameterID { ParamID::arpHold, 1 },    "Arp Hold",   false));
+    layout.add (std::make_unique<ChoiceParam> (juce::ParameterID { ParamID::arpMode, 1 },    "Arp Mode",   juce::StringArray { "Up", "Down", "UpDown", "Random", "AsPlayed" }, 0));
+    layout.add (std::make_unique<ChoiceParam> (juce::ParameterID { ParamID::arpRate, 1 },    "Arp Rate",   juce::StringArray { "1/4", "1/8", "1/8T", "1/16", "1/16T", "1/32" }, 3));
+    layout.add (std::make_unique<IntParam>    (juce::ParameterID { ParamID::arpOctaves, 1 }, "Arp Octaves", 1, 4, 1));
+    layout.add (std::make_unique<FloatParam>  (juce::ParameterID { ParamID::arpGate, 1 },    "Arp Gate",   juce::NormalisableRange<float> (0.05f, 1.0f), 0.5f));
+
     return layout;
 }
 
@@ -85,68 +119,80 @@ XSamplerAudioProcessor::XSamplerAudioProcessor()
       apvts (*this, nullptr, "XSamplerState", createLayout())
 {
     synth = std::make_unique<sfz::Sfizz>();
-    // Set sane defaults BEFORE any samples are configured. Voice count
-    // allocation must happen on a non-audio thread; we re-do it from
-    // prepareToPlay once block size / sample rate are known.
     synth->setSampleRate (44100.0f);
     synth->setSamplesPerBlock (512);
 
-    pMasterGain        = apvts.getRawParameterValue (ParamID::masterGain);
-    pTuneGlobal        = apvts.getRawParameterValue (ParamID::tuneGlobal);
-    pPitchbendRange    = apvts.getRawParameterValue (ParamID::pitchbendRange);
-    pOctaveTranspose   = apvts.getRawParameterValue (ParamID::octaveTranspose);
-    pStartOffset       = apvts.getRawParameterValue (ParamID::startOffset);
-    pAnalogAmount      = apvts.getRawParameterValue (ParamID::analogAmount);
-    pDoublerEnabled    = apvts.getRawParameterValue (ParamID::doublerEnabled);
-    pVoiceMode         = apvts.getRawParameterValue (ParamID::voiceMode);
-    pLegatoEnabled     = apvts.getRawParameterValue (ParamID::legatoEnabled);
-    pPortamentoTime    = apvts.getRawParameterValue (ParamID::portamentoTime);
-    pFingeredPort      = apvts.getRawParameterValue (ParamID::fingeredPort);
-    pFilterType        = apvts.getRawParameterValue (ParamID::filterType);
-    pFilterCutoff      = apvts.getRawParameterValue (ParamID::filterCutoff);
-    pFilterResonance   = apvts.getRawParameterValue (ParamID::filterResonance);
-    pVolAttack         = apvts.getRawParameterValue (ParamID::volAttack);
-    pVolDecay          = apvts.getRawParameterValue (ParamID::volDecay);
-    pVolSustain        = apvts.getRawParameterValue (ParamID::volSustain);
-    pVolRelease        = apvts.getRawParameterValue (ParamID::volRelease);
-    pFilterAttack      = apvts.getRawParameterValue (ParamID::filterAttack);
-    pFilterDecay       = apvts.getRawParameterValue (ParamID::filterDecay);
-    pFilterSustain     = apvts.getRawParameterValue (ParamID::filterSustain);
-    pFilterRelease     = apvts.getRawParameterValue (ParamID::filterRelease);
-    pLfoEnabled        = apvts.getRawParameterValue (ParamID::lfoEnabled);
-    pLfoWaveform       = apvts.getRawParameterValue (ParamID::lfoWaveform);
-    pLfoRate           = apvts.getRawParameterValue (ParamID::lfoRate);
-    pLfoDepth          = apvts.getRawParameterValue (ParamID::lfoDepth);
-    pLfoDelay          = apvts.getRawParameterValue (ParamID::lfoDelay);
-    pLfoTarget         = apvts.getRawParameterValue (ParamID::lfoTarget);
-    pOutputWidth       = apvts.getRawParameterValue (ParamID::outputWidth);
-    pVelToVolume       = apvts.getRawParameterValue (ParamID::velToVolume);
-    pVelToFilter       = apvts.getRawParameterValue (ParamID::velToFilter);
+    #define CACHE(field, id) field = apvts.getRawParameterValue (ParamID::id)
+    CACHE (pMasterGain,      masterGain);
+    CACHE (pTuneGlobal,      tuneGlobal);
+    CACHE (pPitchbendRange,  pitchbendRange);
+    CACHE (pOctaveTranspose, octaveTranspose);
+    CACHE (pStartOffset,     startOffset);
+    CACHE (pAnalogAmount,    analogAmount);
+    CACHE (pDoublerEnabled,  doublerEnabled);
+    CACHE (pVoiceMode,       voiceMode);
+    CACHE (pLegatoEnabled,   legatoEnabled);
+    CACHE (pPortamentoTime,  portamentoTime);
+    CACHE (pFingeredPort,    fingeredPort);
+    CACHE (pFilterType,      filterType);
+    CACHE (pFilterCutoff,    filterCutoff);
+    CACHE (pFilterResonance, filterResonance);
+    CACHE (pVolAttack,       volAttack);
+    CACHE (pVolDecay,        volDecay);
+    CACHE (pVolSustain,      volSustain);
+    CACHE (pVolRelease,      volRelease);
+    CACHE (pFilterAttack,    filterAttack);
+    CACHE (pFilterDecay,     filterDecay);
+    CACHE (pFilterSustain,   filterSustain);
+    CACHE (pFilterRelease,   filterRelease);
+    CACHE (pLfoEnabled,      lfoEnabled);
+    CACHE (pLfoWaveform,     lfoWaveform);
+    CACHE (pLfoRate,         lfoRate);
+    CACHE (pLfoDepth,        lfoDepth);
+    CACHE (pLfoDelay,        lfoDelay);
+    CACHE (pLfoTarget,       lfoTarget);
+    CACHE (pOutputWidth,     outputWidth);
+    CACHE (pVelToVolume,     velToVolume);
+    CACHE (pVelToFilter,     velToFilter);
+    CACHE (pArpEnabled,      arpEnabled);
+    CACHE (pArpHold,         arpHold);
+    CACHE (pArpMode,         arpMode);
+    CACHE (pArpRate,         arpRate);
+    CACHE (pArpOctaves,      arpOctaves);
+    CACHE (pArpGate,         arpGate);
+    #undef CACHE
 
-    // Reserve a sane default voice count on a non-audio thread.
+    for (const auto& id : overlayParams())
+        apvts.addParameterListener (id, this);
+
     synth->setNumVoices (32);
     lastNumVoices = 32;
+
+    startTimerHz (20); // overlay throttle poll
 }
 
-XSamplerAudioProcessor::~XSamplerAudioProcessor() = default;
+XSamplerAudioProcessor::~XSamplerAudioProcessor()
+{
+    stopTimer();
+    for (const auto& id : overlayParams())
+        apvts.removeParameterListener (id, this);
+}
 
 void XSamplerAudioProcessor::prepareToPlay (double sampleRate, int samplesPerBlock)
 {
     currentSampleRate = sampleRate;
-    currentBlockSize  = samplesPerBlock;
 
     const juce::ScopedLock sl (synthLock);
     synth->setSampleRate (static_cast<float> (sampleRate));
     synth->setSamplesPerBlock (samplesPerBlock);
 
-    // Configure voice count here (host thread) so the audio thread never has
-    // to allocate. Match the current voice_mode parameter.
     const bool mono = pVoiceMode != nullptr && pVoiceMode->load() >= 0.5f;
     const int target = mono ? 1 : 32;
     synth->setNumVoices (target);
     lastNumVoices = target;
 
     keyboardState.reset();
+    arp.prepare (sampleRate);
 }
 
 void XSamplerAudioProcessor::releaseResources() {}
@@ -161,15 +207,16 @@ bool XSamplerAudioProcessor::loadSfzFile (const juce::File& file)
     if (! file.existsAsFile())
         return false;
 
-    const juce::ScopedLock sl (synthLock);
-    const bool ok = synth->loadSfzFile (file.getFullPathName().toStdString());
-    if (ok)
-    {
-        currentSfzFile = file;
-        sfzLoaded.store (true, std::memory_order_release);
-        apvts.state.setProperty ("sfzPath", file.getFullPathName(), nullptr);
-    }
-    return ok;
+    const juce::String text = file.loadFileAsString();
+    if (text.isEmpty())
+        return false;
+
+    currentSfzFile = file;
+    currentSfzText = text;
+    apvts.state.setProperty ("sfzPath", file.getFullPathName(), nullptr);
+
+    rebuildAndApplyOverlay();
+    return sfzLoaded.load (std::memory_order_acquire);
 }
 
 juce::File XSamplerAudioProcessor::getCurrentSfzFile() const
@@ -177,27 +224,84 @@ juce::File XSamplerAudioProcessor::getCurrentSfzFile() const
     return currentSfzFile;
 }
 
-void XSamplerAudioProcessor::applyParametersToSfizz()
+void XSamplerAudioProcessor::parameterChanged (const juce::String&, float)
 {
-    // NOTE: setNumVoices is NOT real-time safe (reallocates internal buffers).
-    // It is only ever called from prepareToPlay / loadSfzFile / constructor.
-    // Voice-mode parameter changes therefore take effect on the next
-    // prepareToPlay() — which the host calls when the transport changes
-    // sample rate / block size, or when the plugin is re-instantiated.
+    overlayDirty.store (true, std::memory_order_release);
+    lastChangeMs.store (juce::Time::getMillisecondCounter(), std::memory_order_release);
+}
 
-    // TODO: pitchbend_range — sfizz reads bend_up/bend_down from the SFZ file.
-    //       Apply via a runtime SFZ override or scale pitchwheel ourselves.
-    // TODO: tune_global cents — sfizz has no direct global cents API; could be
-    //       applied by adjusting tuning frequency relative to A4.
-    // TODO: start_offset, analog_amount, doubler, legato, portamento, filter,
-    //       envelopes, LFO, velocity curves — all need runtime SFZ overrides
-    //       or generated <region> wrappers around the loaded instrument.
+void XSamplerAudioProcessor::timerCallback()
+{
+    if (! overlayDirty.load (std::memory_order_acquire)) return;
+
+    const auto now   = juce::Time::getMillisecondCounter();
+    const auto since = now - lastChangeMs.load (std::memory_order_acquire);
+    if (since < 80) return; // wait for the user to settle
+
+    overlayDirty.store (false, std::memory_order_release);
+    rebuildAndApplyOverlay();
+}
+
+void XSamplerAudioProcessor::flushOverlayNow()
+{
+    overlayDirty.store (false, std::memory_order_release);
+    rebuildAndApplyOverlay();
+}
+
+void XSamplerAudioProcessor::rebuildAndApplyOverlay()
+{
+    if (! currentSfzFile.existsAsFile() || currentSfzText.isEmpty())
+        return;
+
+    XSamplerSfzParams sp;
+    sp.tuneCents       = (int) pTuneGlobal->load();
+    sp.mono            = pVoiceMode->load() >= 0.5f;
+    sp.legato          = pLegatoEnabled->load() >= 0.5f;
+    sp.filterType      = (int) pFilterType->load();
+    sp.filterCutoff    = pFilterCutoff->load();
+    sp.filterResonance = pFilterResonance->load();
+    sp.volA            = pVolAttack->load();
+    sp.volD            = pVolDecay->load();
+    sp.volS            = pVolSustain->load();
+    sp.volR            = pVolRelease->load();
+    sp.fltA            = pFilterAttack->load();
+    sp.fltD            = pFilterDecay->load();
+    sp.fltS            = pFilterSustain->load();
+    sp.fltR            = pFilterRelease->load();
+    sp.lfoEnabled      = pLfoEnabled->load() >= 0.5f;
+    sp.lfoWave         = (int) pLfoWaveform->load();
+    sp.lfoRate         = pLfoRate->load();
+    sp.lfoDepth        = pLfoDepth->load();
+    sp.lfoDelay        = pLfoDelay->load();
+    sp.lfoTarget       = (int) pLfoTarget->load();
+    sp.velToVolume     = pVelToVolume->load();
+    sp.velToFilter     = pVelToFilter->load();
+    sp.analogAmount    = pAnalogAmount->load();
+
+    const juce::String combined = buildSfzWithOverride (currentSfzFile, sp);
+    if (combined.isEmpty()) return;
+
+    const juce::ScopedLock sl (synthLock);
+    const bool ok = synth->loadSfzString (
+        currentSfzFile.getFullPathName().toStdString(),
+        combined.toStdString());
+
+    sfzLoaded.store (ok, std::memory_order_release);
+}
+
+void XSamplerAudioProcessor::applyArpSettingsFromParams()
+{
+    arp.setEnabled (pArpEnabled->load() >= 0.5f);
+    arp.setHold    (pArpHold->load()    >= 0.5f);
+    arp.setMode    ((int) pArpMode->load());
+    arp.setRate    ((int) pArpRate->load());
+    arp.setOctaves ((int) pArpOctaves->load());
+    arp.setGate    (pArpGate->load());
 }
 
 void XSamplerAudioProcessor::applyStereoWidth (juce::AudioBuffer<float>& buffer, float width)
 {
-    if (buffer.getNumChannels() < 2)
-        return;
+    if (buffer.getNumChannels() < 2) return;
 
     auto* L = buffer.getWritePointer (0);
     auto* R = buffer.getWritePointer (1);
@@ -221,8 +325,19 @@ void XSamplerAudioProcessor::processBlock (juce::AudioBuffer<float>& buffer,
 
     buffer.clear();
 
-    // Inject any MIDI coming from the on-screen keyboard.
     keyboardState.processNextMidiBuffer (midi, 0, numSamples, true);
+
+    // Tempo for arp.
+    double bpm = 120.0;
+    if (auto* ph = getPlayHead())
+        if (auto pos = ph->getPosition())
+            if (auto b = pos->getBpm())
+                bpm = *b;
+    arp.setBpm (bpm);
+    applyArpSettingsFromParams();
+
+    juce::MidiBuffer arpedMidi;
+    arp.process (midi, arpedMidi, numSamples);
 
     if (! sfzLoaded.load (std::memory_order_acquire))
     {
@@ -232,36 +347,30 @@ void XSamplerAudioProcessor::processBlock (juce::AudioBuffer<float>& buffer,
 
     const juce::ScopedLock sl (synthLock);
 
-    applyParametersToSfizz();
+    const int   octaveShift     = (int) pOctaveTranspose->load() * 12;
+    const float bendRangeSemis  = pPitchbendRange->load();
 
-    const int octaveShift = static_cast<int> (pOctaveTranspose->load()) * 12;
-    const float bendRangeSemis = pPitchbendRange->load();
-
-    for (const auto meta : midi)
+    for (const auto meta : arpedMidi)
     {
         const auto msg    = meta.getMessage();
         const int  sample = meta.samplePosition;
 
         if (msg.isNoteOn())
         {
-            int note = juce::jlimit (0, 127, msg.getNoteNumber() + octaveShift);
+            const int note = juce::jlimit (0, 127, msg.getNoteNumber() + octaveShift);
             synth->noteOn (sample, note, msg.getVelocity());
         }
         else if (msg.isNoteOff())
         {
-            int note = juce::jlimit (0, 127, msg.getNoteNumber() + octaveShift);
+            const int note = juce::jlimit (0, 127, msg.getNoteNumber() + octaveShift);
             synth->noteOff (sample, note, msg.getVelocity());
         }
         else if (msg.isPitchWheel())
         {
-            // JUCE pitchwheel is 0..16383, centred at 8192. sfizz expects the
-            // same 14-bit range. Scale by ratio of requested bend range to
-            // SFZ default (12 semis) so the user's pitchbend_range maps
-            // through correctly even when the SFZ file uses defaults.
-            const int raw   = msg.getPitchWheelValue(); // 0..16383
-            const int delta = raw - 8192;               // -8192..+8191
+            const int raw   = msg.getPitchWheelValue();
+            const int delta = raw - 8192;
             const float scale = bendRangeSemis / 12.0f;
-            int scaled = 8192 + static_cast<int> (delta * scale);
+            int scaled = 8192 + (int) (delta * scale);
             scaled = juce::jlimit (0, 16383, scaled);
             synth->pitchWheel (sample, scaled);
         }
@@ -278,14 +387,9 @@ void XSamplerAudioProcessor::processBlock (juce::AudioBuffer<float>& buffer,
     midi.clear();
 
     float* outs[2] = { buffer.getWritePointer (0), buffer.getWritePointer (1) };
-    // sfizz's API counts STEREO PAIRS, not channels — pass 1 for a single
-    // stereo bus. Passing 2 reads out-of-bounds pointers from `outs[]` and
-    // crashes inside Synth::renderBlock at the initial buffer.fill(0).
-    synth->renderBlock (outs, static_cast<size_t> (numSamples), 1);
+    synth->renderBlock (outs, (size_t) numSamples, 1);
 
-    const float gain = pMasterGain->load();
-    buffer.applyGain (gain);
-
+    buffer.applyGain (pMasterGain->load());
     applyStereoWidth (buffer, pOutputWidth->load());
 }
 
@@ -316,8 +420,7 @@ void XSamplerAudioProcessor::setStateInformation (const void* data, int sizeInBy
             if (path.isNotEmpty())
             {
                 juce::File f (path);
-                if (f.existsAsFile())
-                    loadSfzFile (f);
+                if (f.existsAsFile()) loadSfzFile (f);
             }
         }
     }
