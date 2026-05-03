@@ -51,6 +51,20 @@ build/XSampler_artefacts/Release/
 └── Standalone/XSampler.app
 ```
 
+### Versioned binaries
+
+`./release.sh` builds the plugin and stages the artefacts into `bin/<version>/`.
+The version comes from `project(XSampler VERSION x.y.z ...)` in `CMakeLists.txt`
+— bump it there before each release.
+
+```
+bin/
+└── 0.0.2/
+    ├── XSampler.vst3
+    ├── XSampler.component
+    └── XSampler.app
+```
+
 ### Install the plugin
 
 ```bash

@@ -1,6 +1,5 @@
 build/
 build-ninja/
-bin/
 .DS_Store
 .cache/
 *.user

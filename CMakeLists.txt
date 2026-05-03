@@ -6,7 +6,7 @@ set(CMAKE_XCODE_ATTRIBUTE_CODE_SIGNING_REQUIRED "NO")
 set(CMAKE_XCODE_ATTRIBUTE_CODE_SIGN_IDENTITY "")
 set(CMAKE_XCODE_ATTRIBUTE_CODE_SIGNING_ALLOWED "NO")
 
-project(XSampler VERSION 0.1.0 LANGUAGES C CXX)
+project(XSampler VERSION 0.0.2 LANGUAGES C CXX)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -51,6 +51,7 @@ FetchContent_MakeAvailable(sfizz)
 
 # ---------- Plugin ----------
 juce_add_plugin(XSampler
+    VERSION                  ${PROJECT_VERSION}
     PLUGIN_NAME              "XSampler"
     COMPANY_NAME             "XSampler"
     PLUGIN_MANUFACTURER_CODE Xsam
