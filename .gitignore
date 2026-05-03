@@ -1,0 +1,10 @@
+build/
+build-ninja/
+bin/
+.DS_Store
+.cache/
+*.user
+.idea/
+.vscode/
+cmake-build-*/
+*.tmp
