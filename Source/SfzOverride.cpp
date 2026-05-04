@@ -443,15 +443,23 @@ juce::String buildSfzWithOverride (const juce::File& originalSfz,
         for (const auto& op : names) original = stripOpcode (original, op);
     };
 
-    if (p.ampegActive)       stripList (ampegStrip());
-    if (p.filterActive)      stripList (filterStrip());
-    if (p.ampVelTrackActive) stripList (ampVelTrackStrip());
-    if (p.filVelTrackActive) stripList (filVelTrackStrip());
-    if (p.analogActive)      stripList (analogStrip());
-    if (p.sampleStartActive) stripList (sampleStartStrip());
-    if (p.tuneActive)        stripList (tuneStrip());
-    if (p.mono)              stripList (polyphonyStrip());
-    original = stripOurLfoOpcodes (original);
+    // ALWAYS strip the "light" macros. Our overlay declares each one with
+    // calibrated base + _oncc so the user's macro knob (populated from the
+    // bank's authored value via applySfzAuthoredDefaultsToMacros) controls
+    // the value. Real-time CC, no rebuild on knob movement.
+    stripList (ampegStrip());
+    stripList (ampVelTrackStrip());
+    stripList (filVelTrackStrip());
+    stripList (analogStrip());
+    stripList (sampleStartStrip());
+    stripList (tuneStrip());
+    stripList ({ "bend_up", "bend_down" });
+    if (p.mono) stripList (polyphonyStrip());
+
+    // "Heavy" sections — declaring them adds DSP that decorrelates audio
+    // even at neutral knob values. Strip only when we declare.
+    if (p.filterActive) stripList (filterStrip());
+    original = stripOurLfoOpcodes (original);  // only our lfo99_
 
     if (p.legato && p.mono)
         original = stripOpcode (original, "trigger");
@@ -466,13 +474,45 @@ juce::String buildSfzWithOverride (const juce::File& originalSfz,
     if (p.mono)
         g << "polyphony=1\n";
 
-    if (p.tuneActive)
-        g << "tune=-100\n"
-          << "tune_oncc" << XSamplerCC::Tune << "=200\n";
+    // -------- LIGHT sections: declared ALWAYS, knob fully owns -----------
+    // Each opcode is declared as `base + _oncc` with the base set so
+    // that:
+    //   knob default → CC neutral_value → effective = sfizz default
+    //   (or the authored value, populated into the knob by extractDefaults)
+    //
+    // The user's authored values for these are stripped so the overlay
+    // is the single source of truth.
 
+    // -------- LIGHT REAL-TIME (CC-modulatable in sfizz) -----------------
+    // Tune
+    g << "tune=-100\n"
+      << "tune_oncc" << XSamplerCC::Tune << "=200\n";
+
+    // Volume ADSR — sfizz applies _oncc dynamically.
+    g << "ampeg_attack=0\n"  << "ampeg_attack_oncc"  << XSamplerCC::VolAttack  << "=10\n"
+      << "ampeg_decay=0\n"   << "ampeg_decay_oncc"   << XSamplerCC::VolDecay   << "=10\n"
+      << "ampeg_sustain=0\n" << "ampeg_sustain_oncc" << XSamplerCC::VolSustain << "=100\n"
+      << "ampeg_release=0\n" << "ampeg_release_oncc" << XSamplerCC::VolRelease << "=20\n";
+
+    g << "amp_veltrack=" << juce::roundToInt (p.ampVelTrack) << "\n";
+
+    // pitch_random / delay_random / offset / fil_veltrack only declared
+    // when non-zero — declaring them at 0 has measurable side-effects in
+    // sfizz (e.g. fil_veltrack=0 forces a filter chain into existence).
+    if (juce::roundToInt (p.filVelTrack) != 0)
+        g << "fil_veltrack=" << juce::roundToInt (p.filVelTrack) << "\n";
+    if (p.pitchRandom > 0.001f)
+        g << "pitch_random=" << juce::String (p.pitchRandom, 2) << "\n";
+    if (p.delayRandom > 1.0e-5f)
+        g << "delay_random=" << juce::String (p.delayRandom, 5) << "\n";
+    if (p.sampleOffset > 0.5f)
+        g << "offset=" << juce::roundToInt (p.sampleOffset) << "\n";
+
+    g << "bend_up=2400\nbend_down=-2400\n";
+
+    // -------- HEAVY sections: only when actively engaged ---------------
     if (p.filterActive)
     {
-        g << "bend_up=2400\nbend_down=-2400\n";  // wider bend if filter active
         g << "fil_type="     << sfzFilterType (p.filterType) << "\n"
           << "cutoff=20\n"
           << "cutoff_oncc"   << XSamplerCC::Cutoff     << "=12000\n"
@@ -486,12 +526,6 @@ juce::String buildSfzWithOverride (const juce::File& originalSfz,
           << "fileg_depth_oncc"  << XSamplerCC::FltEnvAmount << "=9600\n";
     }
 
-    if (p.ampegActive)
-        g << "ampeg_attack=0\n"  << "ampeg_attack_oncc"  << XSamplerCC::VolAttack  << "=10\n"
-          << "ampeg_decay=0\n"   << "ampeg_decay_oncc"   << XSamplerCC::VolDecay   << "=10\n"
-          << "ampeg_sustain=0\n" << "ampeg_sustain_oncc" << XSamplerCC::VolSustain << "=100\n"
-          << "ampeg_release=0\n" << "ampeg_release_oncc" << XSamplerCC::VolRelease << "=20\n";
-
     if (p.lfoActive)
     {
         g << "lfo99_freq=0\n"
@@ -503,20 +537,6 @@ juce::String buildSfzWithOverride (const juce::File& originalSfz,
           << XSamplerCC::LfoDepth << "="
           << lfoTargetMaxDepth (p.lfoTarget) << "\n";
     }
-
-    if (p.ampVelTrackActive)
-        g << "amp_veltrack=0\n"
-          << "amp_veltrack_oncc" << XSamplerCC::AmpVelTrack << "=100\n";
-    if (p.filVelTrackActive)
-        g << "fil_veltrack=0\n"
-          << "fil_veltrack_oncc" << XSamplerCC::FilVelTrack << "=4800\n";
-
-    if (p.analogActive)
-        g << "pitch_random_oncc" << XSamplerCC::PitchRandom << "=10\n"
-          << "delay_random_oncc" << XSamplerCC::DelayRandom << "=0.003\n";
-
-    if (p.sampleStartActive)
-        g << "offset_oncc" << XSamplerCC::SampleStart << "=4410\n";
 
     g << "\n";
 

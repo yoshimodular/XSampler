@@ -64,7 +64,12 @@ namespace
             ParamID::lfoTarget,
             ParamID::voiceMode,
             ParamID::legatoEnabled,
-            ParamID::doublerEnabled
+            ParamID::doublerEnabled,
+            // sfizz doesn't honour _oncc for these — we bake them in:
+            ParamID::velToVolume,
+            ParamID::velToFilter,
+            ParamID::analogAmount,
+            ParamID::sampleStart,
         };
         return ids;
     }
@@ -128,26 +133,28 @@ juce::AudioProcessorValueTreeState::ParameterLayout XSamplerAudioProcessor::crea
 
     // -------- Filter -----------------------------------------------------
     layout.add (std::make_unique<ChoiceParam> (juce::ParameterID { ParamID::filterType, 1 },      "Filter Type",       juce::StringArray { "LP", "HP", "BP" }, 0));
-    // Defaults below are deliberately the SFZ-vanilla pass-through values:
-    // at defaults, the overlay must produce audio identical to the bank's
-    // native sound. Any "musically nicer" defaults bias the instrument away
-    // from how the author intended it.
+    // Defaults are sfizz-vanilla pass-through. Our overlay always declares
+    // these opcodes with a `base + _oncc` pattern; the matching knob value
+    // produces the sfizz default (or the bank's authored value, populated
+    // by applySfzAuthoredDefaultsToMacros at load time).
     layout.add (std::make_unique<FloatParam>  (juce::ParameterID { ParamID::filterCutoff, 1 },    "Filter Cutoff",     skewLog (20.0f, 20000.0f),                              20000.0f));
     layout.add (std::make_unique<FloatParam>  (juce::ParameterID { ParamID::filterResonance, 1 }, "Filter Resonance",  Range (0.0f, 1.0f),                                     0.0f));
     layout.add (std::make_unique<FloatParam>  (juce::ParameterID { ParamID::filterEnvAmount, 1 }, "Filter Env Amount", Range (-1.0f, 1.0f),                                    0.0f));
 
     // -------- Volume ADSR + Velocity → Volume ---------------------------
-    layout.add (std::make_unique<FloatParam>  (juce::ParameterID { ParamID::volAttack, 1 },       "Vol Attack",        skewLog (0.001f, 10.0f),                                0.001f));
-    layout.add (std::make_unique<FloatParam>  (juce::ParameterID { ParamID::volDecay, 1 },        "Vol Decay",         skewLog (0.001f, 10.0f),                                0.001f));
+    // Note: ranges start at 0 (not 0.001) so the knob can reproduce the
+    // sfizz default ampeg_attack/decay = 0 exactly.
+    layout.add (std::make_unique<FloatParam>  (juce::ParameterID { ParamID::volAttack, 1 },       "Vol Attack",        skewLog (0.0f, 10.0f),                                  0.0f));
+    layout.add (std::make_unique<FloatParam>  (juce::ParameterID { ParamID::volDecay, 1 },        "Vol Decay",         skewLog (0.0f, 10.0f),                                  0.0f));
     layout.add (std::make_unique<FloatParam>  (juce::ParameterID { ParamID::volSustain, 1 },      "Vol Sustain",       Range (0.0f, 1.0f),                                     1.0f));
-    layout.add (std::make_unique<FloatParam>  (juce::ParameterID { ParamID::volRelease, 1 },      "Vol Release",       skewLog (0.001f, 20.0f),                                0.001f));
+    layout.add (std::make_unique<FloatParam>  (juce::ParameterID { ParamID::volRelease, 1 },      "Vol Release",       skewLog (0.0f, 20.0f),                                  0.001f));
     layout.add (std::make_unique<FloatParam>  (juce::ParameterID { ParamID::velToVolume, 1 },     "Velocity → Volume", Range (0.0f, 1.0f),                                     1.0f));
 
     // -------- Filter ADSR + Velocity → Filter ---------------------------
-    layout.add (std::make_unique<FloatParam>  (juce::ParameterID { ParamID::filterAttack, 1 },    "Filter Attack",     skewLog (0.001f, 10.0f),                                0.001f));
-    layout.add (std::make_unique<FloatParam>  (juce::ParameterID { ParamID::filterDecay, 1 },     "Filter Decay",      skewLog (0.001f, 10.0f),                                0.001f));
+    layout.add (std::make_unique<FloatParam>  (juce::ParameterID { ParamID::filterAttack, 1 },    "Filter Attack",     skewLog (0.0f, 10.0f),                                  0.0f));
+    layout.add (std::make_unique<FloatParam>  (juce::ParameterID { ParamID::filterDecay, 1 },     "Filter Decay",      skewLog (0.0f, 10.0f),                                  0.0f));
     layout.add (std::make_unique<FloatParam>  (juce::ParameterID { ParamID::filterSustain, 1 },   "Filter Sustain",    Range (0.0f, 1.0f),                                     1.0f));
-    layout.add (std::make_unique<FloatParam>  (juce::ParameterID { ParamID::filterRelease, 1 },   "Filter Release",    skewLog (0.001f, 20.0f),                                0.001f));
+    layout.add (std::make_unique<FloatParam>  (juce::ParameterID { ParamID::filterRelease, 1 },   "Filter Release",    skewLog (0.0f, 20.0f),                                  0.001f));
     layout.add (std::make_unique<FloatParam>  (juce::ParameterID { ParamID::velToFilter, 1 },     "Velocity → Filter", Range (0.0f, 1.0f),                                     0.0f));
 
     // -------- LFO --------------------------------------------------------
@@ -474,17 +481,15 @@ void XSamplerAudioProcessor::rebuildAndApplyOverlay()
     sp.filterActive =
             pFilterCutoff->load() < 19000.0f
          || pFilterResonance->load() > 0.001f
-         || std::abs (pFilterEnvAmount->load()) > 0.001f;
-    sp.ampegActive =
-            pVolAttack->load()   > 0.0015f
-         || pVolDecay->load()    > 0.0015f
-         || pVolSustain->load()  < 0.999f
-         || pVolRelease->load()  > 0.0015f;
-    sp.ampVelTrackActive = std::abs (pVelToVolume->load() - 1.0f) > 0.001f;
-    sp.filVelTrackActive = pVelToFilter->load() > 0.001f;
-    sp.analogActive      = pAnalogAmount->load() > 0.001f;
-    sp.sampleStartActive = pSampleStart->load() > 0.001f;
-    sp.tuneActive        = std::abs (pTuneGlobal->load()) > 0.5f;
+         || std::abs (pFilterEnvAmount->load()) > 0.001f
+         || pVelToFilter->load() > 0.001f;
+
+    // Static opcodes baked into the overlay.
+    sp.ampVelTrack  = pVelToVolume->load() * 100.0f;     // 0..1 → 0..100
+    sp.filVelTrack  = pVelToFilter->load() * 4800.0f;    // 0..1 → 0..4800 cents
+    sp.pitchRandom  = pAnalogAmount->load() * 10.0f;     // 0..1 → 0..10 cents
+    sp.delayRandom  = pAnalogAmount->load() * 0.003f;    // 0..1 → 0..3 ms
+    sp.sampleOffset = pSampleStart->load() * 4410.0f;    // 0..1 → 0..4410 samples
 
     lfoActiveCached    = sp.lfoActive;
     filterActiveCached = sp.filterActive;

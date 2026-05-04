@@ -48,7 +48,8 @@ struct ParameterTests : public juce::UnitTest
 
         struct Expect { const char* id; float def; };
         const Expect expects[] = {
-            { "master_gain",         0.8f },
+            // Defaults are sfizz-vanilla pass-through values.
+            { "master_gain",         1.0f },
             { "tune_global",         0.0f },
             { "pitchbend_range",    12.0f },
             { "octave_transpose",    0.0f },
@@ -60,18 +61,18 @@ struct ParameterTests : public juce::UnitTest
             { "portamento_time",     0.0f },
             { "fingered_portamento", 0.0f },
             { "filter_type",         0.0f },
-            { "filter_cutoff",    8000.0f },
+            { "filter_cutoff",   20000.0f },
             { "filter_resonance",    0.0f },
             { "filter_env_amount",   0.0f },
-            { "vol_attack",         0.01f },
-            { "vol_decay",           0.1f },
-            { "vol_sustain",         0.8f },
-            { "vol_release",         0.3f },
-            { "velocity_to_volume",  0.8f },
-            { "filter_attack",      0.01f },
-            { "filter_decay",        0.1f },
-            { "filter_sustain",      0.8f },
-            { "filter_release",      0.3f },
+            { "vol_attack",          0.0f },
+            { "vol_decay",           0.0f },
+            { "vol_sustain",         1.0f },
+            { "vol_release",       0.001f },
+            { "velocity_to_volume",  1.0f },
+            { "filter_attack",       0.0f },
+            { "filter_decay",        0.0f },
+            { "filter_sustain",      1.0f },
+            { "filter_release",    0.001f },
             { "velocity_to_filter",  0.0f },
             { "lfo_waveform",        0.0f },
             { "lfo_rate",            2.0f },
@@ -232,8 +233,8 @@ struct StateRoundTripTests : public juce::UnitTest
         expect (b->getCurrentSfzFile() == tmp, "Restored processor should reload the same SFZ file");
 
         // Knob values are at DEFAULTS, not the tweaked values.
-        const float gainDefault   = 0.8f;
-        const float cutoffDefault = 8000.0f;
+        const float gainDefault   = 1.0f;
+        const float cutoffDefault = 20000.0f;
         expectWithinAbsoluteError (b->apvts.getRawParameterValue ("master_gain")->load(),
                                    gainDefault, 1.0e-4f, "master_gain should be back to default");
         expectWithinAbsoluteError (b->apvts.getRawParameterValue ("filter_cutoff")->load(),
@@ -1450,27 +1451,6 @@ struct VanillaVsOverlayTest : public juce::UnitTest
     }
 };
 
-struct DumpInlinedTest : public juce::UnitTest
-{
-    DumpInlinedTest() : juce::UnitTest ("DEBUG dump inlined", "XSampler") {}
-    void runTest() override {
-        beginTest ("dump");
-        for (auto path : juce::StringArray {
-            "/Users/capitalsound/Library/Mobile Documents/com~apple~CloudDocs/Code/XSampler/SFZ/Resonant2.sfz",
-            "/Users/capitalsound/Library/Mobile Documents/com~apple~CloudDocs/Code/XSampler/TestBanks/erhu/Programs/02-erhu_long.sfz",
-            "/Users/capitalsound/Library/Mobile Documents/com~apple~CloudDocs/Code/XSampler/TestBanks/steeldrum/_jSteelDrum-flac.sfz" })
-        {
-            juce::File f (path);
-            if (! f.existsAsFile()) continue;
-            XSamplerSfzParams sp;
-            auto s = buildSfzWithOverride (f, sp);
-            auto out = juce::File ("/tmp/" + f.getFileNameWithoutExtension() + "_inlined.sfz");
-            out.replaceWithText (s);
-            logMessage ("Wrote " + out.getFullPathName() + " (" + juce::String (s.length()) + " chars)");
-        }
-    }
-};
-
 struct MissingSamplesTest : public juce::UnitTest
 {
     MissingSamplesTest() : juce::UnitTest ("Missing samples are detected", "XSampler") {}
@@ -1661,7 +1641,6 @@ static MonoModeTests        _t_mono;
 static StructuralRebuildHoldNotesTest _t_rebuildHold;
 static PortamentoTests      _t_porta;
 static SfzCompatibilityTests _t_compat;
-static DumpInlinedTest      _t_dump;
 static VanillaVsOverlayTest _t_parity;
 static MissingSamplesTest   _t_missing;
 static ControlAudibilityTests _t_ctrl;

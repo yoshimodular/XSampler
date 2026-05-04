@@ -8,23 +8,28 @@
 // time without a reload.
 struct XSamplerSfzParams
 {
-    bool mono              { false };
-    bool legato            { false };
-    bool doubler           { false };
-    // Per-section "active" flags. The overlay only declares (and strips
-    // user opcodes for) a section when it's active. At defaults nothing
-    // is declared, so playback matches vanilla bit-for-bit.
-    bool ampegActive       { false };  // any vol ADSR knob non-default
-    bool filterActive      { false };  // cutoff < 19k or any reso/env/vel knob >0
-    bool lfoActive         { false };  // lfo_depth > 0
-    bool ampVelTrackActive { false };  // velocity_to_volume != 1.0 (sfizz default)
-    bool filVelTrackActive { false };  // velocity_to_filter > 0
-    bool analogActive      { false };  // analog_amount > 0
-    bool sampleStartActive { false };  // sample_start > 0
-    bool tuneActive        { false };  // tune_global != 0
-    int  filterType        { 0 };
-    int  lfoWave           { 0 };
-    int  lfoTarget         { 0 };
+    bool mono           { false };
+    bool legato         { false };
+    bool doubler        { false };
+
+    // Heavy sections — declaring them adds DSP that decorrelates audio
+    // from vanilla even at neutral CC values. Boundary-gated.
+    bool filterActive   { false };
+    bool lfoActive      { false };
+    int  filterType     { 0 };
+    int  lfoWave        { 0 };
+    int  lfoTarget      { 0 };
+
+    // Static (parse-time) opcode values. sfizz does NOT honour _oncc
+    // modulation for these — the value is locked when the SFZ parses.
+    // We bake in the user's knob value (or the bank's authored value
+    // populated into the knob) at every overlay rebuild. Knob changes
+    // for these trigger a deferred structural rebuild.
+    float ampVelTrack    { 100.0f };  // sfizz default = 100
+    float filVelTrack    { 0.0f };    // sfizz default = 0
+    float pitchRandom    { 0.0f };    // 0..N cents
+    float delayRandom    { 0.0f };    // 0..N seconds
+    float sampleOffset   { 0.0f };    // 0..N samples
 };
 
 // CC numbers used for HDCC-driven, real-time parameter modulation.
