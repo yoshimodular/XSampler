@@ -46,17 +46,14 @@ namespace ParamID
 
 namespace
 {
-    // Parameters that, when changed, require an SFZ overlay rebuild.
-    const juce::StringArray& overlayParams()
+    // Only structural changes require an SFZ overlay rebuild. Everything
+    // else is driven by HDCC, instantly and seamlessly.
+    const juce::StringArray& structuralParams()
     {
         static const juce::StringArray ids {
-            ParamID::tuneGlobal, ParamID::analogAmount,
-            ParamID::filterType, ParamID::filterCutoff, ParamID::filterResonance,
-            ParamID::volAttack, ParamID::volDecay, ParamID::volSustain, ParamID::volRelease,
-            ParamID::filterAttack, ParamID::filterDecay, ParamID::filterSustain, ParamID::filterRelease,
-            ParamID::lfoEnabled, ParamID::lfoWaveform, ParamID::lfoRate, ParamID::lfoDepth,
-            ParamID::lfoDelay, ParamID::lfoTarget,
-            ParamID::velToVolume, ParamID::velToFilter,
+            ParamID::filterType,
+            ParamID::lfoWaveform,
+            ParamID::lfoEnabled,
             ParamID::voiceMode
         };
         return ids;
@@ -162,19 +159,20 @@ XSamplerAudioProcessor::XSamplerAudioProcessor()
     CACHE (pArpGate,         arpGate);
     #undef CACHE
 
-    for (const auto& id : overlayParams())
+    for (const auto& id : structuralParams())
         apvts.addParameterListener (id, this);
 
     synth->setNumVoices (32);
     lastNumVoices = 32;
+    lastCC.fill (-1.0f); // ensure first flushParamCCs sends everything
 
-    startTimerHz (20); // overlay throttle poll
+    startTimerHz (20);
 }
 
 XSamplerAudioProcessor::~XSamplerAudioProcessor()
 {
     stopTimer();
-    for (const auto& id : overlayParams())
+    for (const auto& id : structuralParams())
         apvts.removeParameterListener (id, this);
 }
 
@@ -188,11 +186,23 @@ void XSamplerAudioProcessor::prepareToPlay (double sampleRate, int samplesPerBlo
 
     const bool mono = pVoiceMode != nullptr && pVoiceMode->load() >= 0.5f;
     const int target = mono ? 1 : 32;
-    synth->setNumVoices (target);
-    lastNumVoices = target;
+    if (target != lastNumVoices)
+    {
+        synth->setNumVoices (target);
+        lastNumVoices = target;
+    }
+
+    // 30 ms ramps for both — short enough to track gestures, long enough to
+    // hide step changes from automation.
+    const double smoothSecs = 0.03;
+    gainSmooth.reset  (sampleRate, smoothSecs);
+    widthSmooth.reset (sampleRate, smoothSecs);
+    gainSmooth.setCurrentAndTargetValue  (pMasterGain  != nullptr ? pMasterGain->load()  : 0.8f);
+    widthSmooth.setCurrentAndTargetValue (pOutputWidth != nullptr ? pOutputWidth->load() : 1.0f);
 
     keyboardState.reset();
     arp.prepare (sampleRate);
+    lastCC.fill (-1.0f);
 }
 
 void XSamplerAudioProcessor::releaseResources() {}
@@ -234,9 +244,20 @@ void XSamplerAudioProcessor::timerCallback()
 {
     if (! overlayDirty.load (std::memory_order_acquire)) return;
 
+    // Defer rebuilds until the engine is silent so a structural reload never
+    // cuts an active voice. After 2 s of waiting, force the rebuild — by
+    // then a brief click is preferable to never applying the change.
     const auto now   = juce::Time::getMillisecondCounter();
     const auto since = now - lastChangeMs.load (std::memory_order_acquire);
-    if (since < 80) return; // wait for the user to settle
+    if (since < 60) return;
+
+    int activeVoices = 0;
+    {
+        const juce::ScopedLock sl (synthLock);
+        activeVoices = synth->getNumActiveVoices();
+    }
+    const bool forced = since > 2000;
+    if (activeVoices != 0 && ! forced) return;
 
     overlayDirty.store (false, std::memory_order_release);
     rebuildAndApplyOverlay();
@@ -254,39 +275,95 @@ void XSamplerAudioProcessor::rebuildAndApplyOverlay()
         return;
 
     XSamplerSfzParams sp;
-    sp.tuneCents       = (int) pTuneGlobal->load();
-    sp.mono            = pVoiceMode->load() >= 0.5f;
-    sp.legato          = pLegatoEnabled->load() >= 0.5f;
-    sp.filterType      = (int) pFilterType->load();
-    sp.filterCutoff    = pFilterCutoff->load();
-    sp.filterResonance = pFilterResonance->load();
-    sp.volA            = pVolAttack->load();
-    sp.volD            = pVolDecay->load();
-    sp.volS            = pVolSustain->load();
-    sp.volR            = pVolRelease->load();
-    sp.fltA            = pFilterAttack->load();
-    sp.fltD            = pFilterDecay->load();
-    sp.fltS            = pFilterSustain->load();
-    sp.fltR            = pFilterRelease->load();
-    sp.lfoEnabled      = pLfoEnabled->load() >= 0.5f;
-    sp.lfoWave         = (int) pLfoWaveform->load();
-    sp.lfoRate         = pLfoRate->load();
-    sp.lfoDepth        = pLfoDepth->load();
-    sp.lfoDelay        = pLfoDelay->load();
-    sp.lfoTarget       = (int) pLfoTarget->load();
-    sp.velToVolume     = pVelToVolume->load();
-    sp.velToFilter     = pVelToFilter->load();
-    sp.analogAmount    = pAnalogAmount->load();
+    sp.mono       = pVoiceMode->load()   >= 0.5f;
+    sp.filterType = (int) pFilterType->load();
+    sp.lfoWave    = (int) pLfoWaveform->load();
+    sp.lfoEnabled = pLfoEnabled->load() >= 0.5f;
 
     const juce::String combined = buildSfzWithOverride (currentSfzFile, sp);
     if (combined.isEmpty()) return;
 
-    const juce::ScopedLock sl (synthLock);
-    const bool ok = synth->loadSfzString (
-        currentSfzFile.getFullPathName().toStdString(),
-        combined.toStdString());
+    {
+        const juce::ScopedLock sl (synthLock);
+        const bool ok = synth->loadSfzString (
+            currentSfzFile.getFullPathName().toStdString(),
+            combined.toStdString());
+        sfzLoaded.store (ok, std::memory_order_release);
 
-    sfzLoaded.store (ok, std::memory_order_release);
+        const int targetVoices = sp.mono ? 1 : 32;
+        if (targetVoices != lastNumVoices)
+        {
+            synth->setNumVoices (targetVoices);
+            lastNumVoices = targetVoices;
+        }
+
+        // Push the current CC state into sfizz right now so any noteOn
+        // that arrives before the next processBlock already sees correct
+        // ADSR / cutoff / velocity values.
+        lastCC.fill (-1.0f);
+        flushParamCCs (true);
+    }
+}
+
+void XSamplerAudioProcessor::flushParamCCs (bool forceAll)
+{
+    if (forceAll) lastCC.fill (-1.0f);
+
+    auto send = [this] (int idx, int cc, float v)
+    {
+        v = juce::jlimit (0.0f, 1.0f, v);
+        if (std::abs (v - lastCC[(size_t) idx]) > 1.0e-5f)
+        {
+            synth->hdcc (0, cc, v);
+            lastCC[(size_t) idx] = v;
+        }
+    };
+
+    // Tune: -100..+100  →  0..1
+    send (0,  XSamplerCC::Tune,       (pTuneGlobal->load() + 100.0f) * (1.0f / 200.0f));
+
+    // Cutoff: 20..20480 Hz log
+    {
+        const float c = juce::jlimit (20.0f, 20480.0f, pFilterCutoff->load());
+        const float n = std::log2 (c / 20.0f) * (1.0f / 10.0f); // 10 octaves
+        send (1, XSamplerCC::Cutoff, n);
+    }
+
+    send (2,  XSamplerCC::Resonance,  pFilterResonance->load());
+
+    // Vol ADSR
+    send (3,  XSamplerCC::VolAttack,  pVolAttack->load()  * 0.1f);
+    send (4,  XSamplerCC::VolDecay,   pVolDecay->load()   * 0.1f);
+    send (5,  XSamplerCC::VolSustain, pVolSustain->load());
+    send (6,  XSamplerCC::VolRelease, pVolRelease->load() * 0.05f);
+
+    // Filter ADSR
+    send (7,  XSamplerCC::FltAttack,  pFilterAttack->load()  * 0.1f);
+    send (8,  XSamplerCC::FltDecay,   pFilterDecay->load()   * 0.1f);
+    send (9,  XSamplerCC::FltSustain, pFilterSustain->load());
+    send (10, XSamplerCC::FltRelease, pFilterRelease->load() * 0.05f);
+
+    // LFO 1: only send LFO CCs when LFO is actually declared in the
+    // overlay — sending to undeclared opcodes still trips an internal
+    // sfizz path that silences the synth in 1.2.3.
+    const bool  lfoOn    = pLfoEnabled->load() >= 0.5f;
+    if (lfoOn)
+    {
+        send (11, XSamplerCC::LfoRate,  pLfoRate->load()  * 0.05f);
+        send (12, XSamplerCC::LfoDelay, pLfoDelay->load() * 0.25f);
+
+        const float lfoDepth = pLfoDepth->load();
+        const int   lfoTgt   = (int) pLfoTarget->load();
+        send (13, XSamplerCC::LfoDepthPitch,  lfoTgt == 0 ? lfoDepth : 0.0f);
+        send (14, XSamplerCC::LfoDepthCutoff, lfoTgt == 1 ? lfoDepth : 0.0f);
+        send (15, XSamplerCC::LfoDepthVolume, lfoTgt == 2 ? lfoDepth : 0.0f);
+    }
+
+    // Velocity tracking & analog amount (CC-routed; live too).
+    send (16, XSamplerCC::AmpVelTrack, pVelToVolume->load());
+    send (17, XSamplerCC::FilVelTrack, pVelToFilter->load());
+    send (18, XSamplerCC::PitchRandom, pAnalogAmount->load());
+    send (19, XSamplerCC::DelayRandom, pAnalogAmount->load());
 }
 
 void XSamplerAudioProcessor::applyArpSettingsFromParams()
@@ -299,21 +376,22 @@ void XSamplerAudioProcessor::applyArpSettingsFromParams()
     arp.setGate    (pArpGate->load());
 }
 
-void XSamplerAudioProcessor::applyStereoWidth (juce::AudioBuffer<float>& buffer, float width)
+void XSamplerAudioProcessor::applyStereoWidth (juce::AudioBuffer<float>& buffer)
 {
     if (buffer.getNumChannels() < 2) return;
 
     auto* L = buffer.getWritePointer (0);
     auto* R = buffer.getWritePointer (1);
     const int n = buffer.getNumSamples();
-    const float w = juce::jlimit (0.0f, 1.0f, width);
 
     for (int i = 0; i < n; ++i)
     {
+        const float w    = widthSmooth.getNextValue();
+        const float gain = gainSmooth.getNextValue();
         const float mid  = 0.5f * (L[i] + R[i]);
         const float side = 0.5f * (L[i] - R[i]) * w;
-        L[i] = mid + side;
-        R[i] = mid - side;
+        L[i] = (mid + side) * gain;
+        R[i] = (mid - side) * gain;
     }
 }
 
@@ -345,10 +423,16 @@ void XSamplerAudioProcessor::processBlock (juce::AudioBuffer<float>& buffer,
         return;
     }
 
+    // Update smoothing targets.
+    gainSmooth.setTargetValue  (pMasterGain->load());
+    widthSmooth.setTargetValue (pOutputWidth->load());
+
     const juce::ScopedLock sl (synthLock);
 
-    const int   octaveShift     = (int) pOctaveTranspose->load() * 12;
-    const float bendRangeSemis  = pPitchbendRange->load();
+    flushParamCCs (false);
+
+    const int   octaveShift    = (int) pOctaveTranspose->load() * 12;
+    const float bendRangeSemis = pPitchbendRange->load();
 
     for (const auto meta : arpedMidi)
     {
@@ -369,13 +453,16 @@ void XSamplerAudioProcessor::processBlock (juce::AudioBuffer<float>& buffer,
         {
             const int raw   = msg.getPitchWheelValue();
             const int delta = raw - 8192;
-            const float scale = bendRangeSemis / 12.0f;
+            const float scale = bendRangeSemis * (1.0f / 12.0f);
             int scaled = 8192 + (int) (delta * scale);
             scaled = juce::jlimit (0, 16383, scaled);
             synth->pitchWheel (sample, scaled);
         }
         else if (msg.isController())
         {
+            // Forward host CCs; reserve our own slots (102..127) for internal
+            // use only — those are never echoed in here because the user
+            // can't send them via the keyboard component.
             synth->cc (sample, msg.getControllerNumber(), msg.getControllerValue());
         }
         else if (msg.isAllNotesOff() || msg.isAllSoundOff())
@@ -389,8 +476,7 @@ void XSamplerAudioProcessor::processBlock (juce::AudioBuffer<float>& buffer,
     float* outs[2] = { buffer.getWritePointer (0), buffer.getWritePointer (1) };
     synth->renderBlock (outs, (size_t) numSamples, 1);
 
-    buffer.applyGain (pMasterGain->load());
-    applyStereoWidth (buffer, pOutputWidth->load());
+    applyStereoWidth (buffer);
 }
 
 juce::AudioProcessorEditor* XSamplerAudioProcessor::createEditor()

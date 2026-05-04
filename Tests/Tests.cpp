@@ -677,6 +677,149 @@ struct ArpTests : public juce::UnitTest
 };
 
 //==============================================================================
+struct SmoothParamTests : public juce::UnitTest
+{
+    SmoothParamTests() : juce::UnitTest ("Smooth params (no reload, no gaps)", "XSampler") {}
+
+    void runTest() override
+    {
+        auto p = makePrepared();
+        if (! loadResonant (*p))
+        {
+            beginTest ("Resonant2.sfz available");
+            logMessage ("SKIPPING — SFZ not present");
+            return;
+        }
+
+        // Filter cutoff CC effect — change cutoff WITHOUT calling
+        // flushOverlayNow() between renders, proving it doesn't need reload.
+        beginTest ("Filter cutoff is CC-driven (no overlay rebuild needed)");
+        p->apvts.getParameter ("filter_cutoff")->setValueNotifyingHost (1.0f);
+        auto open = renderHeldNote (*p, 60, 60);
+        const float openHF = bufferHighFreqRMS (open);
+
+        p->apvts.getParameter ("filter_cutoff")->setValueNotifyingHost (0.0f);
+        // NOTE: deliberately NO flushOverlayNow — change must take effect
+        // through the CC routing alone.
+        juce::AudioBuffer<float> blk (2, kBlock);
+        juce::MidiBuffer midi;
+        midi.addEvent (juce::MidiMessage::noteOn (1, 60, (juce::uint8) 100), 0);
+        juce::AudioBuffer<float> closed (2, 60 * kBlock); closed.clear();
+        for (int b = 0; b < 60; ++b)
+        {
+            blk.clear();
+            p->processBlock (blk, midi);
+            midi.clear();
+            for (int ch = 0; ch < 2; ++ch)
+                closed.copyFrom (ch, b * kBlock, blk, ch, 0, kBlock);
+        }
+        const float closedHF = bufferHighFreqRMS (closed);
+        logMessage ("HF RMS open=" + juce::String (openHF, 6) + "  closed=" + juce::String (closedHF, 6));
+        expect (openHF > closedHF * 1.5f, "Cutoff change via CC must reduce HF energy");
+
+        // Continuous parameter sweep produces continuous (non-zero, non-NaN)
+        // audio with no gaps. Drive the cutoff in a smooth ramp during a
+        // sustained note.
+        beginTest ("Continuous parameter changes produce continuous audio (no gaps)");
+        auto* cutoff = p->apvts.getParameter ("filter_cutoff");
+        cutoff->setValueNotifyingHost (1.0f);
+
+        midi.clear();
+        midi.addEvent (juce::MidiMessage::noteOn (1, 60, (juce::uint8) 100), 0);
+        // Warm-up: render a few blocks first so the voice ramps in.
+        for (int b = 0; b < 6; ++b)
+        {
+            blk.clear();
+            p->processBlock (blk, midi);
+            midi.clear();
+        }
+
+        const int sweepBlocks = 80;
+        int silentRuns = 0, longestSilent = 0;
+        for (int b = 0; b < sweepBlocks; ++b)
+        {
+            cutoff->setValueNotifyingHost (1.0f - (float) b / (sweepBlocks - 1));
+
+            blk.clear();
+            p->processBlock (blk, midi);
+
+            // RMS per block — must stay above noise floor for the bulk of
+            // the sweep (until cutoff is genuinely closed at the very end).
+            const float r = bufferRMS (blk);
+            if (r < 1.0e-4f)
+            {
+                ++silentRuns;
+                longestSilent = juce::jmax (longestSilent, silentRuns);
+            }
+            else
+            {
+                silentRuns = 0;
+            }
+        }
+        logMessage ("Longest contiguous silent block run during sweep: " + juce::String (longestSilent));
+        expect (longestSilent <= 6, "Sweeping cutoff should not introduce a long silent gap (= reload glitch)");
+    }
+};
+
+//==============================================================================
+struct MonoModeTests : public juce::UnitTest
+{
+    MonoModeTests() : juce::UnitTest ("Mono mode steals voices", "XSampler") {}
+
+    void runTest() override
+    {
+        auto p = makePrepared();
+        if (! loadResonant (*p))
+        {
+            beginTest ("Resonant2.sfz available");
+            logMessage ("SKIPPING — SFZ not present");
+            return;
+        }
+
+        beginTest ("Mono limits sfizz to 1 active voice");
+        p->apvts.getParameter ("voice_mode")->setValueNotifyingHost (1.0f); // Mono
+        p->flushOverlayNow();
+
+        juce::AudioBuffer<float> blk (2, kBlock);
+        juce::MidiBuffer midi;
+        midi.addEvent (juce::MidiMessage::noteOn (1, 60, (juce::uint8) 100), 0);
+        midi.addEvent (juce::MidiMessage::noteOn (1, 64, (juce::uint8) 100), 0);
+        midi.addEvent (juce::MidiMessage::noteOn (1, 67, (juce::uint8) 100), 0);
+
+        // Render to actually trigger the voices, then sample voice count.
+        for (int b = 0; b < 4; ++b)
+        {
+            blk.clear();
+            p->processBlock (blk, midi);
+            midi.clear();
+        }
+
+        // Reach into the synth via a tiny render with no events to read state.
+        // (Number of active voices is stable after a few blocks.)
+        // We can't easily expose the synth here, but a poly-vs-mono RMS test
+        // proves the difference: 3 stacked notes should be louder than 1.
+        const float monoRms = bufferRMS (blk);
+
+        // Switch to Poly and run again.
+        p->apvts.getParameter ("voice_mode")->setValueNotifyingHost (0.0f);
+        p->flushOverlayNow();
+        midi.addEvent (juce::MidiMessage::noteOn (1, 60, (juce::uint8) 100), 0);
+        midi.addEvent (juce::MidiMessage::noteOn (1, 64, (juce::uint8) 100), 0);
+        midi.addEvent (juce::MidiMessage::noteOn (1, 67, (juce::uint8) 100), 0);
+        for (int b = 0; b < 4; ++b)
+        {
+            blk.clear();
+            p->processBlock (blk, midi);
+            midi.clear();
+        }
+        const float polyRms = bufferRMS (blk);
+
+        logMessage ("RMS  mono=" + juce::String (monoRms, 5) + "  poly=" + juce::String (polyRms, 5));
+        expect (polyRms > monoRms * 1.4f, "Poly mode should be noticeably louder than mono with stacked notes");
+    }
+};
+
+//==============================================================================
 struct EditorTests : public juce::UnitTest
 {
     EditorTests() : juce::UnitTest ("Editor lifecycle", "XSampler") {}
@@ -705,6 +848,8 @@ static MidiHandlingTests    _t_midi;
 static RealSfzSmokeTest     _t_real_sfz;
 static OverlayParamTests    _t_overlay;
 static ArpTests             _t_arp;
+static SmoothParamTests     _t_smooth;
+static MonoModeTests        _t_mono;
 static EditorTests          _t_editor;
 
 int main (int, char**)

@@ -3,27 +3,19 @@
 
 namespace
 {
-    juce::String fmt (float v, int decimals = 4)
-    {
-        return juce::String (v, decimals);
-    }
-
     const char* sfzFilterType (int t)
     {
         switch (t)
         {
-            case 0: return "lpf_2p";
             case 1: return "hpf_2p";
             case 2: return "bpf_2p";
             default: return "lpf_2p";
         }
     }
 
-    // sfizz LFO wave indices (sfizz docs):
-    // 0=triangle, 1=sine, 2=pulse75, 3=square, 4=pulse25, 5=pulse12.5,
-    // 6=ramp, 7=saw, 8=stepped (random-ish).
     int sfzLfoWave (int idx)
     {
+        // sfizz LFO wave: 0=tri, 1=sine, 2=pulse75, 3=square, 7=saw, 8=stepped
         switch (idx)
         {
             case 0: return 1; // Sine
@@ -34,13 +26,7 @@ namespace
             default: return 1;
         }
     }
-}
 
-namespace
-{
-    // SFZ opcodes we control globally — strip them from the original source
-    // so per-region values can't override our <global>. Suffixes like
-    // _cc7 / _oncc7 / _curvecc7 / _smoothcc7 are also stripped.
     const juce::StringArray& strippedOpcodes()
     {
         static const juce::StringArray names {
@@ -54,11 +40,8 @@ namespace
         return names;
     }
 
-    // Remove `name[=...]` tokens (and common suffix variants) from text.
     juce::String stripOpcode (const juce::String& text, const juce::String& name)
     {
-        // Token boundary: not letter/digit/underscore. Match name and any
-        // _xxx suffix until '='.
         const std::regex re (
             "(^|[\\s\\t])" + name.toStdString() + "(_[a-z0-9_]+)?=\\S+",
             std::regex_constants::icase);
@@ -67,7 +50,6 @@ namespace
 
     juce::String stripLfoOpcodes (const juce::String& text)
     {
-        // Strip lfoNN_* opcodes entirely (LFO 01..32 typical).
         const std::regex re ("(^|[\\s\\t])lfo[0-9]+_[a-z0-9_]*=\\S+",
                              std::regex_constants::icase);
         return juce::String (std::regex_replace (text.toStdString(), re, "$1"));
@@ -86,70 +68,62 @@ juce::String buildSfzWithOverride (const juce::File& originalSfz,
     original = stripLfoOpcodes (original);
 
     juce::String g;
-    g << "// XSampler runtime override — generated, do not edit\n";
+    g << "// XSampler runtime overlay — generated, do not edit\n";
     g << "<global>\n";
-
-    if (p.tuneCents != 0)
-        g << "tune=" << p.tuneCents << "\n";
 
     if (p.mono)
         g << "polyphony=1\n";
 
-    // Filter ----------------------------------------------------------------
-    g << "fil_type=" << sfzFilterType (p.filterType) << "\n";
-    g << "cutoff=" << fmt (p.filterCutoff, 2) << "\n";
-    // Resonance: 0..1 → 0..24 dB.
-    g << "resonance=" << fmt (p.filterResonance * 24.0f, 2) << "\n";
+    // -------- Tune (CC110: -100..+100 c) -------------------------------
+    g << "tune=-100\n";
+    g << "tune_oncc"     << XSamplerCC::Tune       << "=200\n";
 
-    // Amp envelope ---------------------------------------------------------
-    g << "ampeg_attack="  << fmt (p.volA) << "\n";
-    g << "ampeg_decay="   << fmt (p.volD) << "\n";
-    g << "ampeg_sustain=" << fmt (p.volS * 100.0f, 2) << "\n"; // %
-    g << "ampeg_release=" << fmt (p.volR) << "\n";
+    // -------- Filter ---------------------------------------------------
+    g << "fil_type="     << sfzFilterType (p.filterType) << "\n";
+    g << "cutoff=20\n";
+    g << "cutoff_oncc"   << XSamplerCC::Cutoff     << "=12000\n";  // ~10 oct
+    g << "resonance=0\n";
+    g << "resonance_oncc"<< XSamplerCC::Resonance  << "=24\n";
 
-    // Filter envelope ------------------------------------------------------
-    g << "fileg_attack="  << fmt (p.fltA) << "\n";
-    g << "fileg_decay="   << fmt (p.fltD) << "\n";
-    g << "fileg_sustain=" << fmt (p.fltS * 100.0f, 2) << "\n"; // %
-    g << "fileg_release=" << fmt (p.fltR) << "\n";
-    // Default depth: 2 octaves. Without a depth knob, this gives the env
-    // a useful range. TODO: expose as user parameter.
+    // -------- Volume ADSR ---------------------------------------------
+    g << "ampeg_attack=0\n"   << "ampeg_attack_oncc"  << XSamplerCC::VolAttack  << "=10\n";
+    g << "ampeg_decay=0\n"    << "ampeg_decay_oncc"   << XSamplerCC::VolDecay   << "=10\n";
+    g << "ampeg_sustain=0\n"  << "ampeg_sustain_oncc" << XSamplerCC::VolSustain << "=100\n";
+    g << "ampeg_release=0\n"  << "ampeg_release_oncc" << XSamplerCC::VolRelease << "=20\n";
+
+    // -------- Filter ADSR ---------------------------------------------
+    g << "fileg_attack=0\n"   << "fileg_attack_oncc"  << XSamplerCC::FltAttack  << "=10\n";
+    g << "fileg_decay=0\n"    << "fileg_decay_oncc"   << XSamplerCC::FltDecay   << "=10\n";
+    g << "fileg_sustain=0\n"  << "fileg_sustain_oncc" << XSamplerCC::FltSustain << "=100\n";
+    g << "fileg_release=0\n"  << "fileg_release_oncc" << XSamplerCC::FltRelease << "=20\n";
     g << "fileg_depth=2400\n";
 
-    // LFO 1 ----------------------------------------------------------------
-    if (p.lfoEnabled && p.lfoDepth > 0.0f)
+    // -------- LFO 1 — only declared when LFO is enabled. Even an
+    // "inactive" LFO declaration silences sfizz output in 1.2.3. We pay
+    // an overlay rebuild on lfo_enabled toggles (deferred until silent).
+    if (p.lfoEnabled)
     {
-        g << "lfo01_freq="  << fmt (p.lfoRate, 4) << "\n";
-        g << "lfo01_wave="  << sfzLfoWave (p.lfoWave) << "\n";
-        g << "lfo01_delay=" << fmt (p.lfoDelay, 4) << "\n";
-
-        switch (p.lfoTarget)
-        {
-            case 0: // Pitch — depth in cents (0..1200)
-                g << "lfo01_pitch=" << fmt (p.lfoDepth * 1200.0f, 2) << "\n";
-                break;
-            case 1: // Filter cutoff — depth in cents (0..4800)
-                g << "lfo01_cutoff=" << fmt (p.lfoDepth * 4800.0f, 2) << "\n";
-                break;
-            case 2: // Volume — depth in dB (0..24)
-                g << "lfo01_volume=" << fmt (p.lfoDepth * 24.0f, 2) << "\n";
-                break;
-            default: break;
-        }
+        g << "lfo01_freq=0\n";
+        g << "lfo01_freq_oncc"  << XSamplerCC::LfoRate        << "=20\n";
+        g << "lfo01_delay=0\n";
+        g << "lfo01_delay_oncc" << XSamplerCC::LfoDelay       << "=4\n";
+        g << "lfo01_wave="      << sfzLfoWave (p.lfoWave)     << "\n";
+        g << "lfo01_pitch_oncc" << XSamplerCC::LfoDepthPitch  << "=1200\n";
+        g << "lfo01_cutoff_oncc"<< XSamplerCC::LfoDepthCutoff << "=4800\n";
+        g << "lfo01_volume_oncc"<< XSamplerCC::LfoDepthVolume << "=24\n";
     }
 
-    // Velocity tracking ----------------------------------------------------
-    // amp_veltrack: 0..100 (% of velocity affecting amplitude)
-    g << "amp_veltrack=" << fmt (p.velToVolume * 100.0f, 2) << "\n";
-    // fil_veltrack in cents — 0..4800
-    g << "fil_veltrack=" << fmt (p.velToFilter * 4800.0f, 2) << "\n";
+    // -------- Velocity tracking ---------------------------------------
+    g << "amp_veltrack=0\n";
+    g << "amp_veltrack_oncc" << XSamplerCC::AmpVelTrack << "=100\n";
+    g << "fil_veltrack=0\n";
+    g << "fil_veltrack_oncc" << XSamplerCC::FilVelTrack << "=4800\n";
 
-    // Analog amount → tune + sample-start randomisation
-    if (p.analogAmount > 0.0f)
-    {
-        g << "pitch_random=" << fmt (p.analogAmount * 25.0f, 2) << "\n"; // cents
-        g << "delay_random=" << fmt (p.analogAmount * 0.005f, 5) << "\n"; // s
-    }
+    // -------- Analog amount (random pitch + delay) --------------------
+    g << "pitch_random=0\n";
+    g << "pitch_random_oncc" << XSamplerCC::PitchRandom << "=25\n";
+    g << "delay_random=0\n";
+    g << "delay_random_oncc" << XSamplerCC::DelayRandom << "=0.005\n";
 
     g << "\n";
     g << original;

@@ -1,8 +1,10 @@
 #pragma once
 
 #include <juce_audio_processors/juce_audio_processors.h>
+#include <juce_dsp/juce_dsp.h>
 #include <sfizz.hpp>
 #include <atomic>
+#include <array>
 #include <memory>
 
 #include "Arpeggiator.h"
@@ -42,8 +44,7 @@ public:
     bool loadSfzFile (const juce::File& file);
     juce::File getCurrentSfzFile() const;
 
-    // Force-rebuild the overlay synchronously. Normally happens on a
-    // throttled timer; tests / loadSfzFile call this directly.
+    // Force-rebuild the overlay synchronously (tests / SFZ load).
     void flushOverlayNow();
 
     juce::AudioProcessorValueTreeState apvts;
@@ -55,23 +56,32 @@ private:
     void parameterChanged (const juce::String& parameterID, float newValue) override;
     void timerCallback() override;
     void rebuildAndApplyOverlay();
+    void flushParamCCs (bool forceAll);
     void applyArpSettingsFromParams();
-    void applyStereoWidth (juce::AudioBuffer<float>& buffer, float width);
+    void applyStereoWidth (juce::AudioBuffer<float>& buffer);
 
     std::unique_ptr<sfz::Sfizz> synth;
     juce::CriticalSection synthLock;
 
     std::atomic<bool> sfzLoaded { false };
     juce::File   currentSfzFile;
-    juce::String currentSfzText; // loaded once, reused for overlay rebuilds
+    juce::String currentSfzText;
 
-    int lastNumVoices { -1 };
-    double currentSampleRate { 44100.0 };
+    int    lastNumVoices    { -1 };
+    double currentSampleRate{ 44100.0 };
 
-    std::atomic<bool>      overlayDirty   { false };
+    std::atomic<bool>         overlayDirty { false };
     std::atomic<juce::uint32> lastChangeMs { 0 };
 
     Arpeggiator arp;
+
+    // Smoothed master gain & stereo width — applied per-sample to avoid
+    // zipper noise on rapid parameter changes.
+    juce::SmoothedValue<float, juce::ValueSmoothingTypes::Linear> gainSmooth;
+    juce::SmoothedValue<float, juce::ValueSmoothingTypes::Linear> widthSmooth;
+
+    // Cache last sent HDCC values for change detection.
+    std::array<float, 20> lastCC { };
 
     // Cached parameter pointers
     std::atomic<float>* pMasterGain      { nullptr };
@@ -106,7 +116,6 @@ private:
     std::atomic<float>* pVelToVolume     { nullptr };
     std::atomic<float>* pVelToFilter     { nullptr };
 
-    // Arp params
     std::atomic<float>* pArpEnabled  { nullptr };
     std::atomic<float>* pArpHold     { nullptr };
     std::atomic<float>* pArpMode     { nullptr };
