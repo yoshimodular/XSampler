@@ -55,7 +55,8 @@ namespace
             "amp_veltrack", "fil_veltrack",
             "tune", "polyphony", "trigger",
             "pitch_random", "delay_random",
-            "offset", "pan"
+            "offset", "pan",
+            "bend_up", "bend_down"
         };
         return names;
     }
@@ -106,6 +107,11 @@ juce::String buildSfzWithOverride (const juce::File& originalSfz,
 
     if (p.mono)
         g << "polyphony=1\n";
+
+    // Fixed wide internal pitch-bend range (24 semis). Our processor
+    // maps the user's `pitchbend_range` onto this so a single rebuild
+    // covers any user setting without overlay rework.
+    g << "bend_up=2400\nbend_down=-2400\n";
 
     // Tune (CC110: -100..+100 c)
     g << "tune=-100\n"

@@ -59,7 +59,12 @@ private:
     void flushParamCCs (bool forceAll);
     void applyArpSettingsFromParams();
     void applyMasterGain (juce::AudioBuffer<float>& buffer);
-    void emitDoublerNotes (const juce::MidiBuffer& in, juce::MidiBuffer& out, int numSamples);
+
+    // Portamento helpers
+    float computePortamentoSeconds (double bpm) const;
+    int   semisToPitchwheel (float semis, float bendRange) const;
+    void  startPortamentoTo (int newNote, double sampleRate, double bpm);
+    void  emitPortamentoBend (int sampleOffset, float bendRangeSemis);
 
     std::unique_ptr<sfz::Sfizz> synth;
     juce::CriticalSection synthLock;
@@ -88,6 +93,17 @@ private:
     // with all-zero depths, hence the gating).
     bool lfoActiveCached { false };
 
+public:
+    // ---- Portamento engine state (public for tests; not for production use)
+    int   portaLastNote        { -1 };
+    float portaCurrentSemis    { 0.0f };
+    float portaSemisPerSample  { 0.0f };
+    int   portaSamplesRemaining{ 0 };
+    int   portaCurrentBendValue{ 8192 };
+    int   userPitchBendValue   { 8192 };
+
+private:
+
     // Track every note currently held at the synth so we can re-trigger
     // them after an urgent overlay rebuild (which calls allSoundOff to
     // avoid hung voices). 0 = not held; otherwise stored velocity.
@@ -98,12 +114,13 @@ private:
     std::atomic<float>* pTuneGlobal      { nullptr };
     std::atomic<float>* pPitchbendRange  { nullptr };
     std::atomic<float>* pOctaveTranspose { nullptr };
-    std::atomic<float>* pStartOffset     { nullptr };
     std::atomic<float>* pAnalogAmount    { nullptr };
     std::atomic<float>* pDoublerEnabled  { nullptr };
     std::atomic<float>* pVoiceMode       { nullptr };
     std::atomic<float>* pLegatoEnabled   { nullptr };
     std::atomic<float>* pPortamentoTime  { nullptr };
+    std::atomic<float>* pPortamentoSync  { nullptr };
+    std::atomic<float>* pPortamentoRate  { nullptr };
     std::atomic<float>* pFingeredPort    { nullptr };
     std::atomic<float>* pFilterType      { nullptr };
     std::atomic<float>* pFilterCutoff    { nullptr };

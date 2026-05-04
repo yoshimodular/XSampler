@@ -891,6 +891,179 @@ struct StructuralRebuildHoldNotesTest : public juce::UnitTest
 };
 
 //==============================================================================
+struct PortamentoTests : public juce::UnitTest
+{
+    PortamentoTests() : juce::UnitTest ("Portamento engine", "XSampler") {}
+
+    static void renderEvents (XSamplerAudioProcessor& p, const juce::MidiBuffer& events,
+                              int blocks = 1)
+    {
+        juce::AudioBuffer<float> blk (2, kBlock);
+        juce::MidiBuffer feed (events);
+        for (int b = 0; b < blocks; ++b)
+        {
+            blk.clear();
+            p.processBlock (blk, feed);
+            feed.clear();
+        }
+    }
+
+    void runTest() override
+    {
+        auto p = makePrepared();
+        if (! loadResonant (*p))
+        {
+            beginTest ("Resonant2.sfz available");
+            logMessage ("SKIPPING — SFZ not present");
+            return;
+        }
+
+        // Force mono so portamento engages.
+        p->apvts.getParameter ("voice_mode")->setValueNotifyingHost (1.0f);
+        p->flushOverlayNow();
+
+        beginTest ("Time mode: portamento_time=0 means no glide");
+        p->apvts.getParameter ("portamento_time")->setValueNotifyingHost (0.0f);
+        p->apvts.getParameter ("portamento_sync")->setValueNotifyingHost (0.0f);
+        p->apvts.getParameter ("fingered_portamento")->setValueNotifyingHost (0.0f);
+
+        juce::MidiBuffer ev;
+        ev.addEvent (juce::MidiMessage::noteOn (1, 60, (juce::uint8) 100), 0);
+        renderEvents (*p, ev, 4);
+        ev.clear();
+        ev.addEvent (juce::MidiMessage::noteOn (1, 64, (juce::uint8) 100), 0);
+        renderEvents (*p, ev, 1);
+        expectEquals (p->portaSamplesRemaining, 0,
+                      "Time=0 must not start a glide");
+
+        beginTest ("Time mode: 0.5s glide at 48 kHz ≈ 24000 samples");
+        p->apvts.getParameter ("portamento_time")->setValueNotifyingHost (
+            p->apvts.getParameter ("portamento_time")->getNormalisableRange().convertTo0to1 (0.5f));
+        // First note (no glide possible).
+        ev.clear();
+        ev.addEvent (juce::MidiMessage::noteOff (1, 64), 0);
+        ev.addEvent (juce::MidiMessage::noteOn (1, 60, (juce::uint8) 100), 1);
+        renderEvents (*p, ev, 4);
+        // Second note: glide expected.
+        ev.clear();
+        ev.addEvent (juce::MidiMessage::noteOn (1, 67, (juce::uint8) 100), 0);
+        renderEvents (*p, ev, 1);
+        const float startSemis = (float) (60 - 67); // -7
+        // After 1 block of glide (256 samples) some progress should have
+        // happened; remaining should be < total.
+        expect (p->portaSamplesRemaining < 24000, "Glide must have advanced");
+        expect (p->portaSamplesRemaining > 0,     "Glide must still be running");
+        // Direction: starting at -7, advancing toward 0 → semis is currently
+        // between -7 and 0.
+        expect (p->portaCurrentSemis > startSemis,
+                "portaCurrentSemis must move toward 0 from start");
+        expect (p->portaCurrentSemis < 0.0f,
+                "portaCurrentSemis must still be negative mid-glide");
+
+        beginTest ("Glide completes — portaCurrentSemis lands on 0");
+        renderEvents (*p, juce::MidiBuffer(), 200); // ~1 s @48k/256
+        expectEquals (p->portaSamplesRemaining, 0, "Glide should have completed");
+        expectWithinAbsoluteError (p->portaCurrentSemis, 0.0f, 1.0e-3f,
+                                   "Final pitch offset should be exactly 0");
+
+        beginTest ("Fingered: glide ONLY when previous key still held");
+        p->apvts.getParameter ("fingered_portamento")->setValueNotifyingHost (1.0f);
+        p->apvts.getParameter ("portamento_time")->setValueNotifyingHost (
+            p->apvts.getParameter ("portamento_time")->getNormalisableRange().convertTo0to1 (0.3f));
+
+        // Setup: play 60, release 60, then play 64 → no glide (not fingered).
+        juce::MidiBuffer e1;
+        e1.addEvent (juce::MidiMessage::noteOn  (1, 60, (juce::uint8) 100), 0);
+        e1.addEvent (juce::MidiMessage::noteOff (1, 60),                    1);
+        renderEvents (*p, e1, 4);
+        juce::MidiBuffer e2;
+        e2.addEvent (juce::MidiMessage::noteOn (1, 64, (juce::uint8) 100), 0);
+        renderEvents (*p, e2, 1);
+        expectEquals (p->portaSamplesRemaining, 0,
+                      "Fingered must NOT glide when previous note was released");
+
+        // Setup: play 60 (still held), play 67 → glide expected.
+        juce::MidiBuffer e3;
+        e3.addEvent (juce::MidiMessage::noteOff (1, 64), 0);
+        e3.addEvent (juce::MidiMessage::noteOn  (1, 60, (juce::uint8) 100), 1);
+        renderEvents (*p, e3, 4);
+        juce::MidiBuffer e4;
+        e4.addEvent (juce::MidiMessage::noteOn (1, 67, (juce::uint8) 100), 0);
+        renderEvents (*p, e4, 1);
+        expect (p->portaSamplesRemaining > 0,
+                "Fingered MUST glide when previous note still held");
+
+        beginTest ("Sync mode: 1/4 at 120 BPM = ~0.5 s glide");
+        // Use user-tempo path (sync to host disabled) for deterministic test.
+        p->apvts.getParameter ("tempo_sync")->setValueNotifyingHost (0.0f);
+        p->apvts.getParameter ("tempo_bpm")->setValueNotifyingHost (
+            p->apvts.getParameter ("tempo_bpm")->getNormalisableRange().convertTo0to1 (120.0f));
+        p->apvts.getParameter ("portamento_sync")->setValueNotifyingHost (1.0f);
+        p->apvts.getParameter ("portamento_rate")->setValueNotifyingHost (
+            p->apvts.getParameter ("portamento_rate")->getNormalisableRange().convertTo0to1 (6.0f));  // 1/4
+        p->apvts.getParameter ("fingered_portamento")->setValueNotifyingHost (0.0f);
+
+        // Reset notes
+        juce::MidiBuffer e5;
+        e5.addEvent (juce::MidiMessage::allNotesOff (1), 0);
+        renderEvents (*p, e5, 1);
+        juce::MidiBuffer e6;
+        e6.addEvent (juce::MidiMessage::noteOn (1, 60, (juce::uint8) 100), 0);
+        renderEvents (*p, e6, 2);
+        juce::MidiBuffer e7;
+        e7.addEvent (juce::MidiMessage::noteOn (1, 62, (juce::uint8) 100), 0);
+        renderEvents (*p, e7, 1);
+        const int expectedSamples = (int) (0.5 * kSR);
+        // After 1 block (256 samples) of glide, remaining ≈ expected - 256.
+        expect (std::abs (p->portaSamplesRemaining - (expectedSamples - kBlock)) < 200,
+                "1/4 @ 120 BPM should map to ~0.5 s of glide");
+
+        beginTest ("Poly mode: portamento disabled");
+        p->apvts.getParameter ("voice_mode")->setValueNotifyingHost (0.0f);
+        p->apvts.getParameter ("portamento_sync")->setValueNotifyingHost (0.0f);
+        p->apvts.getParameter ("portamento_time")->setValueNotifyingHost (
+            p->apvts.getParameter ("portamento_time")->getNormalisableRange().convertTo0to1 (0.5f));
+        p->flushOverlayNow();
+
+        juce::MidiBuffer e8;
+        e8.addEvent (juce::MidiMessage::allNotesOff (1), 0);
+        renderEvents (*p, e8, 1);
+        juce::MidiBuffer e9;
+        e9.addEvent (juce::MidiMessage::noteOn (1, 60, (juce::uint8) 100), 0);
+        renderEvents (*p, e9, 2);
+        juce::MidiBuffer e10;
+        e10.addEvent (juce::MidiMessage::noteOn (1, 67, (juce::uint8) 100), 0);
+        renderEvents (*p, e10, 1);
+        expectEquals (p->portaSamplesRemaining, 0,
+                      "Portamento must be inactive in Poly mode");
+
+        beginTest ("Audio is finite during glide (no NaN)");
+        p->apvts.getParameter ("voice_mode")->setValueNotifyingHost (1.0f);
+        p->flushOverlayNow();
+        juce::MidiBuffer e11;
+        e11.addEvent (juce::MidiMessage::allNotesOff (1), 0);
+        renderEvents (*p, e11, 1);
+        juce::MidiBuffer e12;
+        e12.addEvent (juce::MidiMessage::noteOn (1, 60, (juce::uint8) 100), 0);
+        renderEvents (*p, e12, 2);
+
+        juce::AudioBuffer<float> blk (2, kBlock);
+        juce::MidiBuffer e13;
+        e13.addEvent (juce::MidiMessage::noteOn (1, 67, (juce::uint8) 100), 0);
+        for (int b = 0; b < 60; ++b)
+        {
+            blk.clear();
+            p->processBlock (blk, e13);
+            e13.clear();
+            for (int ch = 0; ch < 2; ++ch)
+                for (int i = 0; i < kBlock; ++i)
+                    expect (std::isfinite (blk.getReadPointer (ch)[i]),
+                            "Non-finite sample during portamento");
+        }
+    }
+};
+
+//==============================================================================
 struct EditorTests : public juce::UnitTest
 {
     EditorTests() : juce::UnitTest ("Editor lifecycle", "XSampler") {}
@@ -922,6 +1095,7 @@ static ArpTests             _t_arp;
 static SmoothParamTests     _t_smooth;
 static MonoModeTests        _t_mono;
 static StructuralRebuildHoldNotesTest _t_rebuildHold;
+static PortamentoTests      _t_porta;
 static EditorTests          _t_editor;
 
 int main (int, char**)

@@ -14,6 +14,8 @@ namespace ParamID
     static constexpr auto voiceMode       = "voice_mode";
     static constexpr auto legatoEnabled   = "legato_enabled";
     static constexpr auto portamentoTime  = "portamento_time";
+    static constexpr auto portamentoSync  = "portamento_sync";
+    static constexpr auto portamentoRate  = "portamento_rate";
     static constexpr auto fingeredPort    = "fingered_portamento";
     static constexpr auto filterType      = "filter_type";
     static constexpr auto filterCutoff    = "filter_cutoff";
@@ -106,7 +108,9 @@ juce::AudioProcessorValueTreeState::ParameterLayout XSamplerAudioProcessor::crea
     // -------- Voicing ----------------------------------------------------
     layout.add (std::make_unique<ChoiceParam> (juce::ParameterID { ParamID::voiceMode, 1 },       "Voice Mode",        juce::StringArray { "Poly", "Mono" }, 0));
     layout.add (std::make_unique<BoolParam>   (juce::ParameterID { ParamID::legatoEnabled, 1 },   "Legato",            false));
-    layout.add (std::make_unique<FloatParam>  (juce::ParameterID { ParamID::portamentoTime, 1 },  "Portamento Time",   skewLog (0.0f, 5.0f, 0.4f),                              0.0f));
+    layout.add (std::make_unique<FloatParam>  (juce::ParameterID { ParamID::portamentoTime, 1 },  "Portamento Time",   skewLog (0.0f, 20.0f, 0.3f),                             0.0f));
+    layout.add (std::make_unique<BoolParam>   (juce::ParameterID { ParamID::portamentoSync, 1 },  "Portamento Sync",   false));
+    layout.add (std::make_unique<ChoiceParam> (juce::ParameterID { ParamID::portamentoRate, 1 },  "Portamento Rate",   juce::StringArray { "1/32", "1/16T", "1/16", "1/8T", "1/8", "1/4T", "1/4", "1/2", "1 bar" }, 4));
     layout.add (std::make_unique<BoolParam>   (juce::ParameterID { ParamID::fingeredPort, 1 },    "Fingered Portamento", false));
 
     // -------- Filter -----------------------------------------------------
@@ -171,6 +175,8 @@ XSamplerAudioProcessor::XSamplerAudioProcessor()
     CACHE (pVoiceMode,       voiceMode);
     CACHE (pLegatoEnabled,   legatoEnabled);
     CACHE (pPortamentoTime,  portamentoTime);
+    CACHE (pPortamentoSync,  portamentoSync);
+    CACHE (pPortamentoRate,  portamentoRate);
     CACHE (pFingeredPort,    fingeredPort);
     CACHE (pFilterType,      filterType);
     CACHE (pFilterCutoff,    filterCutoff);
@@ -245,6 +251,13 @@ void XSamplerAudioProcessor::prepareToPlay (double sampleRate, int samplesPerBlo
     arp.prepare (sampleRate);
     lastCC.fill (-1.0f);
     heldNoteVel.fill (0);
+
+    portaLastNote        = -1;
+    portaCurrentSemis    = 0.0f;
+    portaSemisPerSample  = 0.0f;
+    portaSamplesRemaining = 0;
+    portaCurrentBendValue = 8192;
+    userPitchBendValue    = 8192;
 }
 
 void XSamplerAudioProcessor::releaseResources() {}
@@ -367,15 +380,23 @@ void XSamplerAudioProcessor::rebuildAndApplyOverlay()
 
         // Re-trigger every key the user is currently holding so the change
         // never feels like it dropped notes.
+        synth->pitchWheel (0, 8192);
         const int octaveShift = (int) pOctaveTranspose->load() * 12;
+        int lastReNoteOn = -1;
         for (int n = 0; n < 128; ++n)
         {
             if (heldNoteVel[(size_t) n] > 0)
             {
                 const int shifted = juce::jlimit (0, 127, n + octaveShift);
                 synth->noteOn (0, shifted, heldNoteVel[(size_t) n]);
+                lastReNoteOn = n;
             }
         }
+        // Reset portamento engine — the rebuild created a clean slate.
+        portaCurrentSemis     = 0.0f;
+        portaSamplesRemaining = 0;
+        portaLastNote         = lastReNoteOn;
+        portaCurrentBendValue = 8192;
     }
 }
 
@@ -455,6 +476,91 @@ void XSamplerAudioProcessor::applyArpSettingsFromParams()
     arp.setGate    (pArpGate->load());
 }
 
+float XSamplerAudioProcessor::computePortamentoSeconds (double bpm) const
+{
+    const bool sync = pPortamentoSync->load() >= 0.5f;
+    if (! sync)
+        return pPortamentoTime->load();
+
+    // Sync rate. Indices: 0=1/32, 1=1/16T, 2=1/16, 3=1/8T, 4=1/8,
+    // 5=1/4T, 6=1/4, 7=1/2, 8=1 bar (assumes 4/4).
+    const double secsPerBeat = 60.0 / juce::jmax (1.0, bpm);
+    static constexpr double inBeats[] = {
+        0.125,    // 1/32  = 1/8 beat
+        1.0 / 6,  // 1/16T
+        0.25,    // 1/16
+        1.0 / 3,  // 1/8T
+        0.5,     // 1/8
+        2.0 / 3,  // 1/4T
+        1.0,     // 1/4
+        2.0,     // 1/2
+        4.0      // 1 bar
+    };
+    const int idx = juce::jlimit (0, 8, (int) pPortamentoRate->load());
+    return (float) (inBeats[idx] * secsPerBeat);
+}
+
+// Internal pitch-bend range matches what we declare in the SFZ overlay
+// (bend_up=2400 / bend_down=-2400 → ±24 semitones). The user's
+// `pitchbend_range` is applied as a scaling factor on the wheel input,
+// not on the synth's bend range.
+constexpr float kInternalBendSemis = 24.0f;
+
+int XSamplerAudioProcessor::semisToPitchwheel (float semis, float /*userBendRange*/) const
+{
+    const float clamped = juce::jlimit (-kInternalBendSemis, kInternalBendSemis, semis);
+    const float norm    = clamped / kInternalBendSemis;     // -1..+1
+    const int   bend    = 8192 + (int) std::round (norm * 8191.0f);
+    return juce::jlimit (0, 16383, bend);
+}
+
+void XSamplerAudioProcessor::startPortamentoTo (int newNote, double sampleRate, double bpm)
+{
+    const float timeSec = computePortamentoSeconds (bpm);
+    const bool  fingered = pFingeredPort->load() >= 0.5f;
+    const bool  mono     = pVoiceMode->load()    >= 0.5f;
+
+    // Portamento only meaningful in mono (sfizz pitchwheel is global).
+    if (! mono || timeSec <= 1.0e-4f || portaLastNote < 0)
+    {
+        portaCurrentSemis    = 0.0f;
+        portaSamplesRemaining = 0;
+        portaSemisPerSample  = 0.0f;
+        return;
+    }
+
+    if (fingered && heldNoteVel[(size_t) portaLastNote] == 0)
+    {
+        // Last note no longer physically held: skip glide.
+        portaCurrentSemis    = 0.0f;
+        portaSamplesRemaining = 0;
+        portaSemisPerSample  = 0.0f;
+        return;
+    }
+
+    portaCurrentSemis = (float) (portaLastNote - newNote);
+    const int totalSamples = juce::jmax (32, (int) (timeSec * sampleRate));
+    portaSamplesRemaining = totalSamples;
+    portaSemisPerSample   = -portaCurrentSemis / (float) totalSamples;
+}
+
+void XSamplerAudioProcessor::emitPortamentoBend (int sampleOffset, float userBendRangeSemis)
+{
+    // The user's pitch-bend wheel is interpreted with respect to *their*
+    // pitchbend_range (1..24), then summed with the portamento offset.
+    // Both arrive in semitones and are rendered to the synth's fixed
+    // 24-semi internal range.
+    const float userSemis = ((userPitchBendValue - 8192) / 8191.0f) * userBendRangeSemis;
+    const float total     = userSemis + portaCurrentSemis;
+    const int   bend      = semisToPitchwheel (total, userBendRangeSemis);
+
+    if (bend != portaCurrentBendValue)
+    {
+        synth->pitchWheel (sampleOffset, bend);
+        portaCurrentBendValue = bend;
+    }
+}
+
 void XSamplerAudioProcessor::applyMasterGain (juce::AudioBuffer<float>& buffer)
 {
     const int chans = buffer.getNumChannels();
@@ -506,17 +612,55 @@ void XSamplerAudioProcessor::processBlock (juce::AudioBuffer<float>& buffer,
     const int   octaveShift    = (int) pOctaveTranspose->load() * 12;
     const float bendRangeSemis = pPitchbendRange->load();
 
+    // ---- MIDI dispatch with sample-accurate portamento --------------
+    int lastEmittedSample = -1;
+    constexpr int kPortaStep = 64;  // sub-block resolution for glide
+
+    auto advancePortamentoTo = [&] (int targetSample)
+    {
+        // Emit pitchwheel updates from lastEmittedSample+1 to targetSample
+        // in steps of kPortaStep, advancing portaCurrentSemis.
+        if (portaSamplesRemaining <= 0) return;
+
+        int s = juce::jmax (0, lastEmittedSample + 1);
+        while (s < targetSample && portaSamplesRemaining > 0)
+        {
+            const int adv = juce::jmin (kPortaStep,
+                              juce::jmin (targetSample - s,
+                                          portaSamplesRemaining));
+            portaCurrentSemis    += portaSemisPerSample * (float) adv;
+            portaSamplesRemaining -= adv;
+            s                    += adv;
+            if (portaSamplesRemaining <= 0) portaCurrentSemis = 0.0f;
+            emitPortamentoBend (s, bendRangeSemis);
+        }
+        lastEmittedSample = targetSample;
+    };
+
+    // Initial bend at sample 0 (covers leftover state from previous block).
+    emitPortamentoBend (0, bendRangeSemis);
+    lastEmittedSample = 0;
+
     for (const auto meta : arpedMidi)
     {
         const auto msg    = meta.getMessage();
         const int  sample = meta.samplePosition;
+
+        // Catch portamento up to this event's position before processing it.
+        advancePortamentoTo (sample);
 
         if (msg.isNoteOn())
         {
             const int rawNote = juce::jlimit (0, 127, msg.getNoteNumber());
             const int note = juce::jlimit (0, 127, rawNote + octaveShift);
             heldNoteVel[(size_t) rawNote] = (juce::uint8) msg.getVelocity();
+
+            // Trigger portamento BEFORE the noteOn so the bend lands first.
+            startPortamentoTo (rawNote, currentSampleRate, bpm);
+            emitPortamentoBend (sample, bendRangeSemis);
+
             synth->noteOn (sample, note, msg.getVelocity());
+            portaLastNote = rawNote;
         }
         else if (msg.isNoteOff())
         {
@@ -527,12 +671,9 @@ void XSamplerAudioProcessor::processBlock (juce::AudioBuffer<float>& buffer,
         }
         else if (msg.isPitchWheel())
         {
-            const int raw   = msg.getPitchWheelValue();
-            const int delta = raw - 8192;
-            const float scale = bendRangeSemis * (1.0f / 12.0f);
-            int scaled = 8192 + (int) (delta * scale);
-            scaled = juce::jlimit (0, 16383, scaled);
-            synth->pitchWheel (sample, scaled);
+            // User wheel — fold into the bend we send (combined with porta).
+            userPitchBendValue = msg.getPitchWheelValue();
+            emitPortamentoBend (sample, bendRangeSemis);
         }
         else if (msg.isController())
         {
@@ -541,9 +682,17 @@ void XSamplerAudioProcessor::processBlock (juce::AudioBuffer<float>& buffer,
         else if (msg.isAllNotesOff() || msg.isAllSoundOff())
         {
             heldNoteVel.fill (0);
+            portaCurrentSemis     = 0.0f;
+            portaSamplesRemaining = 0;
+            portaLastNote         = -1;
+            portaCurrentBendValue = -1; // force re-emit
             synth->allSoundOff();
+            synth->pitchWheel (sample, 8192);
         }
     }
+
+    // Ramp portamento to the end of the block.
+    advancePortamentoTo (numSamples);
 
     midi.clear();
 
