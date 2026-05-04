@@ -382,20 +382,46 @@ void XSamplerAudioProcessor::rebuildAndApplyOverlay()
     if (combined.isEmpty()) return;
 
     // Scan the combined source for sample paths and record any that don't
-    // exist on disk. UI / hosts can surface this list to the user.
+    // exist on disk. SFZ values can contain spaces, so we walk line-by-line.
     {
         juce::StringArray missing;
-        const std::regex re ("(^|[\\s\\t])sample=([^\\s\\r\\n]+)");
-        const std::string s = combined.toStdString();
-        for (auto it  = std::sregex_iterator (s.begin(), s.end(), re),
-                  end = std::sregex_iterator(); it != end; ++it)
+        for (const auto& rawLine : juce::StringArray::fromLines (combined))
         {
-            const auto& m = *it;
-            juce::String path (m[2].str());
-            if (! juce::File::isAbsolutePath (path)) continue; // unresolved
-            if (path.startsWith ("*")) continue;               // sfizz oscillator
-            if (! juce::File (path).existsAsFile())
-                missing.addIfNotAlreadyThere (path);
+            juce::String line = rawLine;
+            int from = 0;
+            while (from < line.length())
+            {
+                int pos = line.indexOfIgnoreCase (from, "sample=");
+                if (pos < 0) break;
+                if (pos > 0)
+                {
+                    const juce::juce_wchar prev = line[pos - 1];
+                    if (! (juce::CharacterFunctions::isWhitespace (prev) || prev == '>'))
+                    { from = pos + 1; continue; }
+                }
+                const int valStart = pos + 7;  // "sample="
+                // Take up to next ` <ident>=` or end of line.
+                int valEnd = line.length();
+                for (int i = valStart + 1; i < line.length(); ++i)
+                {
+                    if (juce::CharacterFunctions::isWhitespace (line[i - 1]))
+                    {
+                        int j = i;
+                        while (j < line.length()
+                               && (juce::CharacterFunctions::isLetterOrDigit (line[j]) || line[j] == '_'))
+                            ++j;
+                        if (j < line.length() && j > i && line[j] == '=')
+                        { valEnd = i - 1; break; }
+                    }
+                }
+                juce::String path = line.substring (valStart, valEnd).trim();
+                from = valEnd;
+
+                if (path.isEmpty() || path.startsWith ("*")) continue;
+                if (! juce::File::isAbsolutePath (path)) continue;
+                if (! juce::File (path).existsAsFile())
+                    missing.addIfNotAlreadyThere (path);
+            }
         }
         missingSamples = std::move (missing);
     }

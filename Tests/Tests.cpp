@@ -1243,6 +1243,7 @@ struct MissingSamplesTest : public juce::UnitTest
             expect (p->loadSfzFile (good));
             const auto miss = p->getMissingSamples();
             logMessage ("Resonant2 missing: " + juce::String (miss.size()));
+            for (auto& m : miss) logMessage ("  - " + m);
             expectEquals (miss.size(), 0, "Resonant2 should have no missing samples");
         }
 

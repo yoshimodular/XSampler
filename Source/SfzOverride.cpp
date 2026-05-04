@@ -126,74 +126,119 @@ namespace
     //   2) topDir  / default_path / PATH         (top-level relative)
     // The first one that exists wins; if neither does, we still emit
     // the include-relative absolute (sfizz will report the missing file).
+    // SFZ values for `sample=` can legitimately contain spaces (e.g.
+    // `Resonant2 Samples/foo.flac`), so we can't stop at the next
+    // whitespace. Instead we capture everything up to either EOL or the
+    // next opcode keyword on the same line — `<space>identifier=`.
     juce::String absolutiseSamplePaths (const juce::String& text,
                                         const juce::File& baseDir,
                                         const juce::File& topDir)
     {
-        // Token-based pass over each opcode `key=value`.
-        const std::regex re (
-            "(^|[\\s\\t])(default_path|sample)=([^\\s\\r\\n]+)",
-            std::regex_constants::icase);
-
-        const std::string in = text.toStdString();
-        std::string out;
-        out.reserve (in.size());
-
         juce::String defaultPath;  // accumulated default_path
-        auto it  = std::sregex_iterator (in.begin(), in.end(), re);
-        auto end = std::sregex_iterator();
-        std::size_t lastEnd = 0;
+        juce::StringArray lines = juce::StringArray::fromLines (text);
 
-        for (; it != end; ++it)
+        auto extractValueAndTail = [] (const juce::String& after) -> std::pair<juce::String, juce::String>
         {
-            const auto& m = *it;
-            out.append (in, lastEnd, (std::size_t) m.position() - lastEnd);
-
-            juce::String key (m[2].str());
-            juce::String val (m[3].str());
-            val = val.replaceCharacter ('\\', '/');
-
-            if (key.equalsIgnoreCase ("default_path"))
+            // Walk forward looking for the next ` <ident>=` start.
+            const int n = after.length();
+            for (int i = 1; i < n; ++i)
             {
-                // Bake this in for subsequent samples; drop the opcode.
-                defaultPath = val;
-                if (! defaultPath.endsWith ("/"))
-                    defaultPath << "/";
-                out.append (m[1].str());
-                out.append ("// [absorbed default_path=");
-                out.append (val.toStdString());
-                out.append ("]");
-            }
-            else // sample
-            {
-                juce::File resolved;
-                if (juce::File::isAbsolutePath (val))
+                if (juce::CharacterFunctions::isWhitespace (after[i - 1]))
                 {
-                    resolved = juce::File (val);
+                    int j = i;
+                    while (j < n && (juce::CharacterFunctions::isLetterOrDigit (after[j]) || after[j] == '_'))
+                        ++j;
+                    if (j < n && j > i && after[j] == '=')
+                        return { after.substring (0, i - 1).trimEnd(), after.substring (i - 1) };
+                }
+            }
+            return { after.trimEnd(), juce::String() };
+        };
+
+        for (auto& line : lines)
+        {
+            // Find every default_path= and sample= occurrence in the line.
+            int searchFrom = 0;
+            while (searchFrom < line.length())
+            {
+                int posDP = line.indexOfIgnoreCase (searchFrom, "default_path=");
+                int posSA = line.indexOfIgnoreCase (searchFrom, "sample=");
+                int pos   = (posDP >= 0 && (posSA < 0 || posDP < posSA)) ? posDP : posSA;
+                if (pos < 0) break;
+
+                // Make sure it's at start-of-line or preceded by whitespace
+                // / `<>` (so we don't match `amp_sample=…` or similar).
+                if (pos > 0)
+                {
+                    const juce::juce_wchar prev = line[pos - 1];
+                    if (! (juce::CharacterFunctions::isWhitespace (prev)
+                           || prev == '>'))
+                    {
+                        searchFrom = pos + 1;
+                        continue;
+                    }
+                }
+
+                const bool isSample = (pos == posSA && (posDP < 0 || posSA < posDP));
+                const juce::String key = isSample ? "sample" : "default_path";
+                const int valueStart   = pos + key.length() + 1;  // skip "key="
+                const auto [val0, tail] = extractValueAndTail (line.substring (valueStart));
+                juce::String val = val0.replaceCharacter ('\\', '/');
+
+                juce::String replacement;
+                if (! isSample)
+                {
+                    defaultPath = val;
+                    if (defaultPath.isNotEmpty() && ! defaultPath.endsWith ("/"))
+                        defaultPath << "/";
+                    replacement = "// [absorbed default_path=" + val + "]";
                 }
                 else
                 {
-                    auto tryResolve = [&] (const juce::File& root) {
-                        juce::File r = root;
-                        if (defaultPath.isNotEmpty())
-                            r = r.getChildFile (defaultPath);
-                        return r.getChildFile (val);
-                    };
-                    juce::File a = tryResolve (baseDir);
-                    juce::File b = tryResolve (topDir);
-                    if (a.existsAsFile())      resolved = a;
-                    else if (b.existsAsFile()) resolved = b;
-                    else                       resolved = a; // sfizz will error
+                    // sfizz built-in oscillators / generators (*sine, *saw,
+                    // *square, *triangle, *noise, *silence) start with '*'
+                    // and must NOT be absolutised — they're not files.
+                    if (val.startsWithChar ('*'))
+                    {
+                        replacement = "sample=" + val;
+                    }
+                    else
+                    {
+                        juce::File resolved;
+                        if (juce::File::isAbsolutePath (val))
+                        {
+                            resolved = juce::File (val);
+                        }
+                        else
+                        {
+                            auto tryResolve = [&] (const juce::File& root) {
+                                juce::File r = root;
+                                if (defaultPath.isNotEmpty())
+                                    r = r.getChildFile (defaultPath);
+                                return r.getChildFile (val);
+                            };
+                            juce::File a = tryResolve (baseDir);
+                            juce::File b = tryResolve (topDir);
+                            if (a.existsAsFile())      resolved = a;
+                            else if (b.existsAsFile()) resolved = b;
+                            else                       resolved = a;
+                        }
+                        replacement = "sample=" + resolved.getFullPathName();
+                    }
                 }
-                out.append (m[1].str());
-                out.append ("sample=");
-                out.append (resolved.getFullPathName().toStdString());
-            }
 
-            lastEnd = (std::size_t) m.position() + (std::size_t) m.length();
+                // Splice replacement into the line.
+                const int matchEnd = valueStart + val0.length();
+                juce::String newLine = line.substring (0, pos) + replacement;
+                if (tail.isNotEmpty()) newLine << tail;
+                else newLine << line.substring (matchEnd);
+
+                line = newLine;
+                searchFrom = pos + replacement.length();
+            }
         }
-        out.append (in, lastEnd, in.size() - lastEnd);
-        return juce::String (out);
+
+        return lines.joinIntoString ("\n");
     }
 
     // `pathStack` carries the chain of currently-open files. A re-entry
@@ -269,6 +314,53 @@ namespace
     }
 }
 
+// Inject `body` (a list of opcodes, no <global> header) into every
+// `<global>` block in `text`. Also wraps any `<master>`/`<group>`/
+// `<region>` content that appears before the FIRST `<global>` in an
+// implicit `<global>` containing `body` (and any leading user opcodes
+// that were sitting in default scope).
+static juce::String injectIntoEveryGlobal (const juce::String& text,
+                                           const juce::String& body)
+{
+    // Find every `<global>` header.
+    juce::Array<int> positions;
+    int p = 0;
+    while ((p = text.indexOf (p, "<global>")) >= 0)
+    {
+        positions.add (p);
+        p += 8;
+    }
+
+    if (positions.isEmpty())
+    {
+        // No <global> in user content → prepend one. Place it BEFORE any
+        // <master>/<group>/<region> so subsequent regions inherit it.
+        int regHdr = text.indexOf ("<region>");
+        for (auto h : { "<group>", "<master>" })
+        {
+            int q = text.indexOf (h);
+            if (q >= 0 && (regHdr < 0 || q < regHdr)) regHdr = q;
+        }
+        if (regHdr < 0)
+            return text + "\n<global>\n" + body + "\n";
+
+        juce::String pre  = text.substring (0, regHdr);
+        juce::String post = text.substring (regHdr);
+        return pre + "<global>\n" + body + "\n" + post;
+    }
+
+    juce::String out;
+    int lastEnd = 0;
+    for (int pos : positions)
+    {
+        const int afterHeader = pos + 8;
+        out << text.substring (lastEnd, afterHeader) << "\n" << body << "\n";
+        lastEnd = afterHeader;
+    }
+    out << text.substring (lastEnd);
+    return out;
+}
+
 juce::String buildSfzWithOverride (const juce::File& originalSfz,
                                    const XSamplerSfzParams& p)
 {
@@ -295,10 +387,10 @@ juce::String buildSfzWithOverride (const juce::File& originalSfz,
     if (p.doubler)
         original = stripOpcode (original, "pan");
 
-    // Build our <global> block.
+    // Build our overlay opcode body (NO <global> header — we inject this
+    // into every user <global> block to survive global-scope resets).
     juce::String g;
-    g << "// XSampler runtime overlay — generated, do not edit\n";
-    g << "<global>\n";
+    g << "// XSampler runtime overlay\n";
 
     if (p.mono)
         g << "polyphony=1\n";
@@ -360,67 +452,52 @@ juce::String buildSfzWithOverride (const juce::File& originalSfz,
 
     g << "\n";
 
-    // -------- Splice the overlay into the right place ------------------
-    // If the user's file has a `<control>` block, our <global> goes AFTER
-    // it (control must come before global per SFZ spec). Otherwise it
-    // goes at the top.
-    const int hdrPos = firstNonControlHeader (original);
+    juce::String result;
 
-    juce::String preamble, body;
-    if (hdrPos >= 0)
-    {
-        preamble = original.substring (0, hdrPos);
-        body     = original.substring (hdrPos);
-    }
-    else
-    {
-        preamble = original;
-        body     = juce::String();
-    }
-
-    juce::String out;
-
-    // Doubler / legato need the region body duplicated. For simple modes
-    // we just stitch [preamble] + [our overlay] + [body].
+    // Legato / doubler still wrap regions, so do that BEFORE injecting our
+    // opcodes into <global>s.
     if (p.legato && p.mono)
     {
-        const int rPos = firstRegionHeader (body);
+        const int rPos = firstRegionHeader (original);
         if (rPos < 0)
         {
-            out << preamble << g << "trigger=legato\n" << body;
+            result = "trigger=legato\n" + original;
         }
         else
         {
-            const juce::String beforeRegions = body.substring (0, rPos);
-            const juce::String regionBlock   = body.substring (rPos);
-            out << preamble << g << beforeRegions
-                << "<group>\ntrigger=first\n"  << regionBlock << "\n"
-                << "<group>\ntrigger=legato\n" << regionBlock << "\n";
+            const juce::String beforeRegions = original.substring (0, rPos);
+            const juce::String regionBlock   = original.substring (rPos);
+            result << beforeRegions
+                   << "<group>\ntrigger=first\n"  << regionBlock << "\n"
+                   << "<group>\ntrigger=legato\n" << regionBlock << "\n";
         }
     }
     else if (p.doubler)
     {
-        const int rPos = firstRegionHeader (body);
+        const int rPos = firstRegionHeader (original);
         if (rPos < 0)
         {
-            out << preamble << g << body;
+            result = original;
         }
         else
         {
-            const juce::String beforeRegions = body.substring (0, rPos);
-            const juce::String regionBlock   = body.substring (rPos);
-            out << preamble << g << beforeRegions
-                << "<group>\npan=-100\ntune_oncc"  << XSamplerCC::PitchRandom << "=-25\n"
-                << regionBlock << "\n"
-                << "<group>\npan=100\ntune_oncc"   << XSamplerCC::PitchRandom << "=25\n"
-                << "delay_oncc"                    << XSamplerCC::DelayRandom << "=0.005\n"
-                << regionBlock << "\n";
+            const juce::String beforeRegions = original.substring (0, rPos);
+            const juce::String regionBlock   = original.substring (rPos);
+            result << beforeRegions
+                   << "<group>\npan=-100\ntune_oncc"  << XSamplerCC::PitchRandom << "=-25\n"
+                   << regionBlock << "\n"
+                   << "<group>\npan=100\ntune_oncc"   << XSamplerCC::PitchRandom << "=25\n"
+                   << "delay_oncc"                    << XSamplerCC::DelayRandom << "=0.005\n"
+                   << regionBlock << "\n";
         }
     }
     else
     {
-        out << preamble << g << body;
+        result = original;
     }
 
-    return out;
+    // Now inject our overlay body into every <global> in the result so
+    // we override every time the user's content opens a fresh global
+    // scope (which would otherwise reset our opcodes).
+    return injectIntoEveryGlobal (result, g);
 }
