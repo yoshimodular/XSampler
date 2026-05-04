@@ -58,7 +58,8 @@ private:
     void rebuildAndApplyOverlay();
     void flushParamCCs (bool forceAll);
     void applyArpSettingsFromParams();
-    void applyStereoWidth (juce::AudioBuffer<float>& buffer);
+    void applyMasterGain (juce::AudioBuffer<float>& buffer);
+    void emitDoublerNotes (const juce::MidiBuffer& in, juce::MidiBuffer& out, int numSamples);
 
     std::unique_ptr<sfz::Sfizz> synth;
     juce::CriticalSection synthLock;
@@ -70,18 +71,26 @@ private:
     int    lastNumVoices    { -1 };
     double currentSampleRate{ 44100.0 };
 
-    std::atomic<bool>         overlayDirty { false };
-    std::atomic<juce::uint32> lastChangeMs { 0 };
+    std::atomic<bool>         overlayDirty  { false };
+    std::atomic<bool>         overlayUrgent { false };
+    std::atomic<juce::uint32> lastChangeMs  { 0 };
 
     Arpeggiator arp;
 
-    // Smoothed master gain & stereo width — applied per-sample to avoid
-    // zipper noise on rapid parameter changes.
+    // Smoothed master gain — per-sample to avoid zipper noise.
     juce::SmoothedValue<float, juce::ValueSmoothingTypes::Linear> gainSmooth;
-    juce::SmoothedValue<float, juce::ValueSmoothingTypes::Linear> widthSmooth;
 
     // Cache last sent HDCC values for change detection.
-    std::array<float, 20> lastCC { };
+    std::array<float, 24> lastCC { };
+
+    // True when LFO depth crosses 0 → triggers an overlay rebuild so the
+    // LFO opcodes are added/removed (sfizz silences if LFO is declared
+    // with all-zero depths, hence the gating).
+    bool lfoActiveCached { false };
+
+    // Doubler MIDI duplication state. We track each user-played note so
+    // a noteOff sends the matching pair off too.
+    std::array<int, 128> doublerPair {};   // -1 if not played, else paired note number
 
     // Cached parameter pointers
     std::atomic<float>* pMasterGain      { nullptr };
@@ -106,15 +115,17 @@ private:
     std::atomic<float>* pFilterDecay     { nullptr };
     std::atomic<float>* pFilterSustain   { nullptr };
     std::atomic<float>* pFilterRelease   { nullptr };
-    std::atomic<float>* pLfoEnabled      { nullptr };
     std::atomic<float>* pLfoWaveform     { nullptr };
     std::atomic<float>* pLfoRate         { nullptr };
     std::atomic<float>* pLfoDepth        { nullptr };
     std::atomic<float>* pLfoDelay        { nullptr };
     std::atomic<float>* pLfoTarget       { nullptr };
-    std::atomic<float>* pOutputWidth     { nullptr };
     std::atomic<float>* pVelToVolume     { nullptr };
     std::atomic<float>* pVelToFilter     { nullptr };
+    std::atomic<float>* pFilterEnvAmount { nullptr };
+    std::atomic<float>* pSampleStart     { nullptr };
+    std::atomic<float>* pTempoBpm        { nullptr };
+    std::atomic<float>* pTempoSync       { nullptr };
 
     std::atomic<float>* pArpEnabled  { nullptr };
     std::atomic<float>* pArpHold     { nullptr };

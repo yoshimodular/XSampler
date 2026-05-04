@@ -32,9 +32,12 @@ namespace ParamID
     static constexpr auto lfoDepth        = "lfo_depth";
     static constexpr auto lfoDelay        = "lfo_delay";
     static constexpr auto lfoTarget       = "lfo_target";
-    static constexpr auto outputWidth     = "output_width";
     static constexpr auto velToVolume     = "velocity_to_volume";
     static constexpr auto velToFilter     = "velocity_to_filter";
+    static constexpr auto filterEnvAmount = "filter_env_amount";
+    static constexpr auto sampleStart     = "sample_start";
+    static constexpr auto tempoBpm        = "tempo_bpm";
+    static constexpr auto tempoSync       = "tempo_sync";
 
     static constexpr auto arpEnabled = "arp_enabled";
     static constexpr auto arpHold    = "arp_hold";
@@ -48,13 +51,29 @@ namespace
 {
     // Only structural changes require an SFZ overlay rebuild. Everything
     // else is driven by HDCC, instantly and seamlessly.
+    // Changes to these IDs require an SFZ overlay rebuild. Everything else
+    // is HDCC-driven and applies seamlessly.
     const juce::StringArray& structuralParams()
     {
         static const juce::StringArray ids {
             ParamID::filterType,
             ParamID::lfoWaveform,
-            ParamID::lfoEnabled,
-            ParamID::voiceMode
+            ParamID::lfoTarget,
+            ParamID::voiceMode,
+            ParamID::legatoEnabled,
+            ParamID::doublerEnabled
+        };
+        return ids;
+    }
+    // These are still rebuild-required, but get applied IMMEDIATELY (with
+    // a brief click on active voices) rather than waiting for silence,
+    // because the user expects them to take effect on toggle.
+    const juce::StringArray& urgentStructuralParams()
+    {
+        static const juce::StringArray ids {
+            ParamID::voiceMode,
+            ParamID::doublerEnabled,
+            ParamID::legatoEnabled
         };
         return ids;
     }
@@ -69,44 +88,66 @@ juce::AudioProcessorValueTreeState::ParameterLayout XSamplerAudioProcessor::crea
 
     juce::AudioProcessorValueTreeState::ParameterLayout layout;
 
-    layout.add (std::make_unique<FloatParam>  (juce::ParameterID { ParamID::masterGain, 1 },      "Master Gain",       juce::NormalisableRange<float> (0.0f, 1.0f),    0.8f));
+    using Range = juce::NormalisableRange<float>;
+    // Helper: skewed range biased toward the lower end (typical for time/freq).
+    auto skewLog = [] (float a, float b, float skew = 0.3f) {
+        return Range (a, b, 0.0f, skew);
+    };
+
+    // -------- Global ------------------------------------------------------
+    layout.add (std::make_unique<FloatParam>  (juce::ParameterID { ParamID::masterGain, 1 },      "Master Gain",       Range (0.0f, 1.0f),                                     0.8f));
     layout.add (std::make_unique<IntParam>    (juce::ParameterID { ParamID::tuneGlobal, 1 },      "Tune Global",       -100, 100, 0));
     layout.add (std::make_unique<IntParam>    (juce::ParameterID { ParamID::pitchbendRange, 1 },  "Pitchbend Range",   1, 24, 12));
     layout.add (std::make_unique<IntParam>    (juce::ParameterID { ParamID::octaveTranspose, 1 }, "Octave Transpose",  -3, 3, 0));
-    layout.add (std::make_unique<FloatParam>  (juce::ParameterID { ParamID::startOffset, 1 },     "Start Offset",      juce::NormalisableRange<float> (0.0f, 1.0f),    0.0f));
-    layout.add (std::make_unique<FloatParam>  (juce::ParameterID { ParamID::analogAmount, 1 },    "Analog Amount",     juce::NormalisableRange<float> (0.0f, 1.0f),    0.0f));
-    layout.add (std::make_unique<BoolParam>   (juce::ParameterID { ParamID::doublerEnabled, 1 },  "Doubler",           false));
+    layout.add (std::make_unique<FloatParam>  (juce::ParameterID { ParamID::sampleStart, 1 },     "Sample Start",      Range (0.0f, 1.0f),                                     0.0f));
+    layout.add (std::make_unique<FloatParam>  (juce::ParameterID { ParamID::analogAmount, 1 },    "Analog / Doubler Amount", Range (0.0f, 1.0f),                                0.0f));
+    layout.add (std::make_unique<BoolParam>   (juce::ParameterID { ParamID::doublerEnabled, 1 },  "Doubler Mode",      false));
+
+    // -------- Voicing ----------------------------------------------------
     layout.add (std::make_unique<ChoiceParam> (juce::ParameterID { ParamID::voiceMode, 1 },       "Voice Mode",        juce::StringArray { "Poly", "Mono" }, 0));
     layout.add (std::make_unique<BoolParam>   (juce::ParameterID { ParamID::legatoEnabled, 1 },   "Legato",            false));
-    layout.add (std::make_unique<FloatParam>  (juce::ParameterID { ParamID::portamentoTime, 1 },  "Portamento Time",   juce::NormalisableRange<float> (0.0f, 5.0f),    0.0f));
+    layout.add (std::make_unique<FloatParam>  (juce::ParameterID { ParamID::portamentoTime, 1 },  "Portamento Time",   skewLog (0.0f, 5.0f, 0.4f),                              0.0f));
     layout.add (std::make_unique<BoolParam>   (juce::ParameterID { ParamID::fingeredPort, 1 },    "Fingered Portamento", false));
-    layout.add (std::make_unique<ChoiceParam> (juce::ParameterID { ParamID::filterType, 1 },      "Filter Type",       juce::StringArray { "LP", "HP", "BP" }, 0));
-    layout.add (std::make_unique<FloatParam>  (juce::ParameterID { ParamID::filterCutoff, 1 },    "Filter Cutoff",     juce::NormalisableRange<float> (20.0f, 20000.0f, 0.0f, 0.3f), 8000.0f));
-    layout.add (std::make_unique<FloatParam>  (juce::ParameterID { ParamID::filterResonance, 1 }, "Filter Resonance",  juce::NormalisableRange<float> (0.0f, 1.0f),    0.0f));
-    layout.add (std::make_unique<FloatParam>  (juce::ParameterID { ParamID::volAttack, 1 },       "Vol Attack",        juce::NormalisableRange<float> (0.001f, 10.0f, 0.0f, 0.3f),  0.01f));
-    layout.add (std::make_unique<FloatParam>  (juce::ParameterID { ParamID::volDecay, 1 },        "Vol Decay",         juce::NormalisableRange<float> (0.001f, 10.0f, 0.0f, 0.3f),  0.1f));
-    layout.add (std::make_unique<FloatParam>  (juce::ParameterID { ParamID::volSustain, 1 },      "Vol Sustain",       juce::NormalisableRange<float> (0.0f, 1.0f),    0.8f));
-    layout.add (std::make_unique<FloatParam>  (juce::ParameterID { ParamID::volRelease, 1 },      "Vol Release",       juce::NormalisableRange<float> (0.001f, 20.0f, 0.0f, 0.3f), 0.3f));
-    layout.add (std::make_unique<FloatParam>  (juce::ParameterID { ParamID::filterAttack, 1 },    "Filter Attack",     juce::NormalisableRange<float> (0.001f, 10.0f, 0.0f, 0.3f),  0.01f));
-    layout.add (std::make_unique<FloatParam>  (juce::ParameterID { ParamID::filterDecay, 1 },     "Filter Decay",      juce::NormalisableRange<float> (0.001f, 10.0f, 0.0f, 0.3f),  0.1f));
-    layout.add (std::make_unique<FloatParam>  (juce::ParameterID { ParamID::filterSustain, 1 },   "Filter Sustain",    juce::NormalisableRange<float> (0.0f, 1.0f),    0.8f));
-    layout.add (std::make_unique<FloatParam>  (juce::ParameterID { ParamID::filterRelease, 1 },   "Filter Release",    juce::NormalisableRange<float> (0.001f, 20.0f, 0.0f, 0.3f), 0.3f));
-    layout.add (std::make_unique<BoolParam>   (juce::ParameterID { ParamID::lfoEnabled, 1 },      "LFO Enabled",       false));
-    layout.add (std::make_unique<ChoiceParam> (juce::ParameterID { ParamID::lfoWaveform, 1 },     "LFO Waveform",      juce::StringArray { "Sine", "Tri", "Saw", "Sq", "Random" }, 0));
-    layout.add (std::make_unique<FloatParam>  (juce::ParameterID { ParamID::lfoRate, 1 },         "LFO Rate",          juce::NormalisableRange<float> (0.01f, 20.0f, 0.0f, 0.3f),  2.0f));
-    layout.add (std::make_unique<FloatParam>  (juce::ParameterID { ParamID::lfoDepth, 1 },        "LFO Depth",         juce::NormalisableRange<float> (0.0f, 1.0f),    0.0f));
-    layout.add (std::make_unique<FloatParam>  (juce::ParameterID { ParamID::lfoDelay, 1 },        "LFO Delay",         juce::NormalisableRange<float> (0.0f, 4.0f),    0.0f));
-    layout.add (std::make_unique<ChoiceParam> (juce::ParameterID { ParamID::lfoTarget, 1 },       "LFO Target",        juce::StringArray { "Pitch", "Filter", "Volume" }, 0));
-    layout.add (std::make_unique<FloatParam>  (juce::ParameterID { ParamID::outputWidth, 1 },     "Output Width",      juce::NormalisableRange<float> (0.0f, 1.0f),    1.0f));
-    layout.add (std::make_unique<FloatParam>  (juce::ParameterID { ParamID::velToVolume, 1 },     "Velocity → Volume", juce::NormalisableRange<float> (0.0f, 1.0f),    0.8f));
-    layout.add (std::make_unique<FloatParam>  (juce::ParameterID { ParamID::velToFilter, 1 },     "Velocity → Filter", juce::NormalisableRange<float> (0.0f, 1.0f),    0.0f));
 
+    // -------- Filter -----------------------------------------------------
+    layout.add (std::make_unique<ChoiceParam> (juce::ParameterID { ParamID::filterType, 1 },      "Filter Type",       juce::StringArray { "LP", "HP", "BP" }, 0));
+    layout.add (std::make_unique<FloatParam>  (juce::ParameterID { ParamID::filterCutoff, 1 },    "Filter Cutoff",     skewLog (20.0f, 20000.0f),                              8000.0f));
+    layout.add (std::make_unique<FloatParam>  (juce::ParameterID { ParamID::filterResonance, 1 }, "Filter Resonance",  Range (0.0f, 1.0f),                                     0.0f));
+    layout.add (std::make_unique<FloatParam>  (juce::ParameterID { ParamID::filterEnvAmount, 1 }, "Filter Env Amount", Range (-1.0f, 1.0f),                                    0.0f));
+
+    // -------- Volume ADSR + Velocity → Volume ---------------------------
+    layout.add (std::make_unique<FloatParam>  (juce::ParameterID { ParamID::volAttack, 1 },       "Vol Attack",        skewLog (0.001f, 10.0f),                                0.01f));
+    layout.add (std::make_unique<FloatParam>  (juce::ParameterID { ParamID::volDecay, 1 },        "Vol Decay",         skewLog (0.001f, 10.0f),                                0.1f));
+    layout.add (std::make_unique<FloatParam>  (juce::ParameterID { ParamID::volSustain, 1 },      "Vol Sustain",       Range (0.0f, 1.0f),                                     0.8f));
+    layout.add (std::make_unique<FloatParam>  (juce::ParameterID { ParamID::volRelease, 1 },      "Vol Release",       skewLog (0.001f, 20.0f),                                0.3f));
+    layout.add (std::make_unique<FloatParam>  (juce::ParameterID { ParamID::velToVolume, 1 },     "Velocity → Volume", Range (0.0f, 1.0f),                                     0.8f));
+
+    // -------- Filter ADSR + Velocity → Filter ---------------------------
+    layout.add (std::make_unique<FloatParam>  (juce::ParameterID { ParamID::filterAttack, 1 },    "Filter Attack",     skewLog (0.001f, 10.0f),                                0.01f));
+    layout.add (std::make_unique<FloatParam>  (juce::ParameterID { ParamID::filterDecay, 1 },     "Filter Decay",      skewLog (0.001f, 10.0f),                                0.1f));
+    layout.add (std::make_unique<FloatParam>  (juce::ParameterID { ParamID::filterSustain, 1 },   "Filter Sustain",    Range (0.0f, 1.0f),                                     0.8f));
+    layout.add (std::make_unique<FloatParam>  (juce::ParameterID { ParamID::filterRelease, 1 },   "Filter Release",    skewLog (0.001f, 20.0f),                                0.3f));
+    layout.add (std::make_unique<FloatParam>  (juce::ParameterID { ParamID::velToFilter, 1 },     "Velocity → Filter", Range (0.0f, 1.0f),                                     0.0f));
+
+    // -------- LFO --------------------------------------------------------
+    // No explicit LFO On/Off — depth=0 means inactive.
+    layout.add (std::make_unique<ChoiceParam> (juce::ParameterID { ParamID::lfoWaveform, 1 },     "LFO Waveform",      juce::StringArray { "Sine", "Tri", "Saw", "Sq", "Random" }, 0));
+    layout.add (std::make_unique<FloatParam>  (juce::ParameterID { ParamID::lfoRate, 1 },         "LFO Rate",          skewLog (0.01f, 20.0f),                                 2.0f));
+    layout.add (std::make_unique<FloatParam>  (juce::ParameterID { ParamID::lfoDepth, 1 },        "LFO Depth",         Range (0.0f, 1.0f),                                     0.0f));
+    layout.add (std::make_unique<FloatParam>  (juce::ParameterID { ParamID::lfoDelay, 1 },        "LFO Delay",         skewLog (0.0f, 4.0f, 0.4f),                             0.0f));
+    layout.add (std::make_unique<ChoiceParam> (juce::ParameterID { ParamID::lfoTarget, 1 },       "LFO Target",        juce::StringArray { "Pitch", "Filter", "Volume" }, 0));
+
+    // -------- Tempo ------------------------------------------------------
+    layout.add (std::make_unique<FloatParam>  (juce::ParameterID { ParamID::tempoBpm, 1 },        "Tempo (BPM)",       Range (30.0f, 300.0f),                                  120.0f));
+    layout.add (std::make_unique<BoolParam>   (juce::ParameterID { ParamID::tempoSync, 1 },       "Sync to Host",      true));
+
+    // -------- Arpeggiator ----------------------------------------------
     layout.add (std::make_unique<BoolParam>   (juce::ParameterID { ParamID::arpEnabled, 1 }, "Arp",        false));
     layout.add (std::make_unique<BoolParam>   (juce::ParameterID { ParamID::arpHold, 1 },    "Arp Hold",   false));
     layout.add (std::make_unique<ChoiceParam> (juce::ParameterID { ParamID::arpMode, 1 },    "Arp Mode",   juce::StringArray { "Up", "Down", "UpDown", "Random", "AsPlayed" }, 0));
     layout.add (std::make_unique<ChoiceParam> (juce::ParameterID { ParamID::arpRate, 1 },    "Arp Rate",   juce::StringArray { "1/4", "1/8", "1/8T", "1/16", "1/16T", "1/32" }, 3));
     layout.add (std::make_unique<IntParam>    (juce::ParameterID { ParamID::arpOctaves, 1 }, "Arp Octaves", 1, 4, 1));
-    layout.add (std::make_unique<FloatParam>  (juce::ParameterID { ParamID::arpGate, 1 },    "Arp Gate",   juce::NormalisableRange<float> (0.05f, 1.0f), 0.5f));
+    layout.add (std::make_unique<FloatParam>  (juce::ParameterID { ParamID::arpGate, 1 },    "Arp Gate",   Range (0.05f, 1.0f),                                                 0.5f));
 
     return layout;
 }
@@ -124,7 +165,7 @@ XSamplerAudioProcessor::XSamplerAudioProcessor()
     CACHE (pTuneGlobal,      tuneGlobal);
     CACHE (pPitchbendRange,  pitchbendRange);
     CACHE (pOctaveTranspose, octaveTranspose);
-    CACHE (pStartOffset,     startOffset);
+    CACHE (pSampleStart,     sampleStart);
     CACHE (pAnalogAmount,    analogAmount);
     CACHE (pDoublerEnabled,  doublerEnabled);
     CACHE (pVoiceMode,       voiceMode);
@@ -142,15 +183,16 @@ XSamplerAudioProcessor::XSamplerAudioProcessor()
     CACHE (pFilterDecay,     filterDecay);
     CACHE (pFilterSustain,   filterSustain);
     CACHE (pFilterRelease,   filterRelease);
-    CACHE (pLfoEnabled,      lfoEnabled);
     CACHE (pLfoWaveform,     lfoWaveform);
     CACHE (pLfoRate,         lfoRate);
     CACHE (pLfoDepth,        lfoDepth);
     CACHE (pLfoDelay,        lfoDelay);
     CACHE (pLfoTarget,       lfoTarget);
-    CACHE (pOutputWidth,     outputWidth);
     CACHE (pVelToVolume,     velToVolume);
     CACHE (pVelToFilter,     velToFilter);
+    CACHE (pFilterEnvAmount, filterEnvAmount);
+    CACHE (pTempoBpm,        tempoBpm);
+    CACHE (pTempoSync,       tempoSync);
     CACHE (pArpEnabled,      arpEnabled);
     CACHE (pArpHold,         arpHold);
     CACHE (pArpMode,         arpMode);
@@ -192,17 +234,13 @@ void XSamplerAudioProcessor::prepareToPlay (double sampleRate, int samplesPerBlo
         lastNumVoices = target;
     }
 
-    // 30 ms ramps for both — short enough to track gestures, long enough to
-    // hide step changes from automation.
-    const double smoothSecs = 0.03;
-    gainSmooth.reset  (sampleRate, smoothSecs);
-    widthSmooth.reset (sampleRate, smoothSecs);
-    gainSmooth.setCurrentAndTargetValue  (pMasterGain  != nullptr ? pMasterGain->load()  : 0.8f);
-    widthSmooth.setCurrentAndTargetValue (pOutputWidth != nullptr ? pOutputWidth->load() : 1.0f);
+    gainSmooth.reset (sampleRate, 0.03);
+    gainSmooth.setCurrentAndTargetValue (pMasterGain != nullptr ? pMasterGain->load() : 0.8f);
 
     keyboardState.reset();
     arp.prepare (sampleRate);
     lastCC.fill (-1.0f);
+    doublerPair.fill (-1);
 }
 
 void XSamplerAudioProcessor::releaseResources() {}
@@ -234,32 +272,38 @@ juce::File XSamplerAudioProcessor::getCurrentSfzFile() const
     return currentSfzFile;
 }
 
-void XSamplerAudioProcessor::parameterChanged (const juce::String&, float)
+void XSamplerAudioProcessor::parameterChanged (const juce::String& id, float)
 {
     overlayDirty.store (true, std::memory_order_release);
     lastChangeMs.store (juce::Time::getMillisecondCounter(), std::memory_order_release);
+    if (urgentStructuralParams().contains (id))
+        overlayUrgent.store (true, std::memory_order_release);
 }
 
 void XSamplerAudioProcessor::timerCallback()
 {
     if (! overlayDirty.load (std::memory_order_acquire)) return;
 
-    // Defer rebuilds until the engine is silent so a structural reload never
-    // cuts an active voice. After 2 s of waiting, force the rebuild — by
-    // then a brief click is preferable to never applying the change.
     const auto now   = juce::Time::getMillisecondCounter();
     const auto since = now - lastChangeMs.load (std::memory_order_acquire);
     if (since < 60) return;
 
-    int activeVoices = 0;
-    {
-        const juce::ScopedLock sl (synthLock);
-        activeVoices = synth->getNumActiveVoices();
-    }
-    const bool forced = since > 2000;
-    if (activeVoices != 0 && ! forced) return;
+    const bool urgent = overlayUrgent.load (std::memory_order_acquire);
 
-    overlayDirty.store (false, std::memory_order_release);
+    if (! urgent)
+    {
+        // Wait until silent so the click of a reload is hidden.
+        int activeVoices = 0;
+        {
+            const juce::ScopedLock sl (synthLock);
+            activeVoices = synth->getNumActiveVoices();
+        }
+        const bool forced = since > 2000;
+        if (activeVoices != 0 && ! forced) return;
+    }
+
+    overlayDirty.store  (false, std::memory_order_release);
+    overlayUrgent.store (false, std::memory_order_release);
     rebuildAndApplyOverlay();
 }
 
@@ -275,10 +319,14 @@ void XSamplerAudioProcessor::rebuildAndApplyOverlay()
         return;
 
     XSamplerSfzParams sp;
-    sp.mono       = pVoiceMode->load()   >= 0.5f;
+    sp.mono       = pVoiceMode->load()      >= 0.5f;
+    sp.legato     = pLegatoEnabled->load()  >= 0.5f;
+    sp.doubler    = pDoublerEnabled->load() >= 0.5f;
     sp.filterType = (int) pFilterType->load();
     sp.lfoWave    = (int) pLfoWaveform->load();
-    sp.lfoEnabled = pLfoEnabled->load() >= 0.5f;
+    sp.lfoTarget  = (int) pLfoTarget->load();
+    sp.lfoActive  = pLfoDepth->load() > 0.0001f;
+    lfoActiveCached = sp.lfoActive;
 
     const juce::String combined = buildSfzWithOverride (currentSfzFile, sp);
     if (combined.isEmpty()) return;
@@ -343,27 +391,32 @@ void XSamplerAudioProcessor::flushParamCCs (bool forceAll)
     send (9,  XSamplerCC::FltSustain, pFilterSustain->load());
     send (10, XSamplerCC::FltRelease, pFilterRelease->load() * 0.05f);
 
-    // LFO 1: only send LFO CCs when LFO is actually declared in the
-    // overlay — sending to undeclared opcodes still trips an internal
-    // sfizz path that silences the synth in 1.2.3.
-    const bool  lfoOn    = pLfoEnabled->load() >= 0.5f;
-    if (lfoOn)
-    {
-        send (11, XSamplerCC::LfoRate,  pLfoRate->load()  * 0.05f);
-        send (12, XSamplerCC::LfoDelay, pLfoDelay->load() * 0.25f);
+    // Filter envelope amount: -1..+1 → CC 0..1 (0.5 = neutral, 0 = -4800c,
+    // 1 = +4800c, both signs supported by the bipolar overlay declaration).
+    send (11, XSamplerCC::FltEnvAmount, (pFilterEnvAmount->load() + 1.0f) * 0.5f);
 
-        const float lfoDepth = pLfoDepth->load();
-        const int   lfoTgt   = (int) pLfoTarget->load();
-        send (13, XSamplerCC::LfoDepthPitch,  lfoTgt == 0 ? lfoDepth : 0.0f);
-        send (14, XSamplerCC::LfoDepthCutoff, lfoTgt == 1 ? lfoDepth : 0.0f);
-        send (15, XSamplerCC::LfoDepthVolume, lfoTgt == 2 ? lfoDepth : 0.0f);
+    // LFO: only send when active (overlay declared). Sending CCs for
+    // undeclared opcodes is harmless but wastes work.
+    if (lfoActiveCached)
+    {
+        send (12, XSamplerCC::LfoRate,  pLfoRate->load()  * 0.05f);
+        send (13, XSamplerCC::LfoDelay, pLfoDelay->load() * 0.25f);
+        send (14, XSamplerCC::LfoDepth, pLfoDepth->load());
     }
 
-    // Velocity tracking & analog amount (CC-routed; live too).
-    send (16, XSamplerCC::AmpVelTrack, pVelToVolume->load());
-    send (17, XSamplerCC::FilVelTrack, pVelToFilter->load());
-    send (18, XSamplerCC::PitchRandom, pAnalogAmount->load());
-    send (19, XSamplerCC::DelayRandom, pAnalogAmount->load());
+    // Velocity tracking
+    send (15, XSamplerCC::AmpVelTrack, pVelToVolume->load());
+    send (16, XSamplerCC::FilVelTrack, pVelToFilter->load());
+
+    // Analog amount: drives subtle random pitch + delay (only meaningful
+    // when doubler is OFF; the doubler overlay re-uses the same CCs to
+    // detune L vs R, so the slider feeds both modes from the same knob).
+    const float analog = pAnalogAmount->load();
+    send (17, XSamplerCC::PitchRandom, analog);
+    send (18, XSamplerCC::DelayRandom, analog);
+
+    // Sample start (offset)
+    send (19, XSamplerCC::SampleStart, pSampleStart->load());
 }
 
 void XSamplerAudioProcessor::applyArpSettingsFromParams()
@@ -376,22 +429,15 @@ void XSamplerAudioProcessor::applyArpSettingsFromParams()
     arp.setGate    (pArpGate->load());
 }
 
-void XSamplerAudioProcessor::applyStereoWidth (juce::AudioBuffer<float>& buffer)
+void XSamplerAudioProcessor::applyMasterGain (juce::AudioBuffer<float>& buffer)
 {
-    if (buffer.getNumChannels() < 2) return;
-
-    auto* L = buffer.getWritePointer (0);
-    auto* R = buffer.getWritePointer (1);
-    const int n = buffer.getNumSamples();
-
+    const int chans = buffer.getNumChannels();
+    const int n     = buffer.getNumSamples();
     for (int i = 0; i < n; ++i)
     {
-        const float w    = widthSmooth.getNextValue();
         const float gain = gainSmooth.getNextValue();
-        const float mid  = 0.5f * (L[i] + R[i]);
-        const float side = 0.5f * (L[i] - R[i]) * w;
-        L[i] = (mid + side) * gain;
-        R[i] = (mid - side) * gain;
+        for (int c = 0; c < chans; ++c)
+            buffer.getWritePointer (c)[i] *= gain;
     }
 }
 
@@ -405,12 +451,14 @@ void XSamplerAudioProcessor::processBlock (juce::AudioBuffer<float>& buffer,
 
     keyboardState.processNextMidiBuffer (midi, 0, numSamples, true);
 
-    // Tempo for arp.
-    double bpm = 120.0;
-    if (auto* ph = getPlayHead())
-        if (auto pos = ph->getPosition())
-            if (auto b = pos->getBpm())
-                bpm = *b;
+    // Tempo: host or user knob, depending on tempo_sync.
+    const bool sync = pTempoSync->load() >= 0.5f;
+    double bpm = pTempoBpm->load();
+    if (sync)
+        if (auto* ph = getPlayHead())
+            if (auto pos = ph->getPosition())
+                if (auto b = pos->getBpm())
+                    bpm = *b;
     arp.setBpm (bpm);
     applyArpSettingsFromParams();
 
@@ -423,9 +471,7 @@ void XSamplerAudioProcessor::processBlock (juce::AudioBuffer<float>& buffer,
         return;
     }
 
-    // Update smoothing targets.
-    gainSmooth.setTargetValue  (pMasterGain->load());
-    widthSmooth.setTargetValue (pOutputWidth->load());
+    gainSmooth.setTargetValue (pMasterGain->load());
 
     const juce::ScopedLock sl (synthLock);
 
@@ -460,9 +506,6 @@ void XSamplerAudioProcessor::processBlock (juce::AudioBuffer<float>& buffer,
         }
         else if (msg.isController())
         {
-            // Forward host CCs; reserve our own slots (102..127) for internal
-            // use only — those are never echoed in here because the user
-            // can't send them via the keyboard component.
             synth->cc (sample, msg.getControllerNumber(), msg.getControllerValue());
         }
         else if (msg.isAllNotesOff() || msg.isAllSoundOff())
@@ -476,7 +519,7 @@ void XSamplerAudioProcessor::processBlock (juce::AudioBuffer<float>& buffer,
     float* outs[2] = { buffer.getWritePointer (0), buffer.getWritePointer (1) };
     synth->renderBlock (outs, (size_t) numSamples, 1);
 
-    applyStereoWidth (buffer);
+    applyMasterGain (buffer);
 }
 
 juce::AudioProcessorEditor* XSamplerAudioProcessor::createEditor()

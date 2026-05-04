@@ -52,7 +52,7 @@ struct ParameterTests : public juce::UnitTest
             { "tune_global",         0.0f },
             { "pitchbend_range",    12.0f },
             { "octave_transpose",    0.0f },
-            { "start_offset",        0.0f },
+            { "sample_start",        0.0f },
             { "analog_amount",       0.0f },
             { "doubler_enabled",     0.0f },
             { "voice_mode",          0.0f },
@@ -62,23 +62,24 @@ struct ParameterTests : public juce::UnitTest
             { "filter_type",         0.0f },
             { "filter_cutoff",    8000.0f },
             { "filter_resonance",    0.0f },
+            { "filter_env_amount",   0.0f },
             { "vol_attack",         0.01f },
             { "vol_decay",           0.1f },
             { "vol_sustain",         0.8f },
             { "vol_release",         0.3f },
+            { "velocity_to_volume",  0.8f },
             { "filter_attack",      0.01f },
             { "filter_decay",        0.1f },
             { "filter_sustain",      0.8f },
             { "filter_release",      0.3f },
-            { "lfo_enabled",         0.0f },
+            { "velocity_to_filter",  0.0f },
             { "lfo_waveform",        0.0f },
             { "lfo_rate",            2.0f },
             { "lfo_depth",           0.0f },
             { "lfo_delay",           0.0f },
             { "lfo_target",          0.0f },
-            { "output_width",        1.0f },
-            { "velocity_to_volume",  0.8f },
-            { "velocity_to_filter",  0.0f },
+            { "tempo_bpm",         120.0f },
+            { "tempo_sync",          1.0f },
         };
 
         for (auto& e : expects)
@@ -89,7 +90,11 @@ struct ParameterTests : public juce::UnitTest
             expectWithinAbsoluteError (raw->load(), e.def, 1.0e-3f,
                 juce::String ("Default mismatch for ") + e.id);
         }
-        expectEquals ((int) std::size (expects), 31, "Parameter count drift");
+
+        // Removed parameters should NOT exist.
+        for (const char* dead : { "lfo_enabled", "output_width", "start_offset" })
+            expect (a.getRawParameterValue (dead) == nullptr,
+                    juce::String ("Removed param still present: ") + dead);
     }
 };
 
