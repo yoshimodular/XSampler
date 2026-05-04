@@ -100,7 +100,7 @@ juce::AudioProcessorValueTreeState::ParameterLayout XSamplerAudioProcessor::crea
     layout.add (std::make_unique<IntParam>    (juce::ParameterID { ParamID::pitchbendRange, 1 },  "Pitchbend Range",   1, 24, 12));
     layout.add (std::make_unique<IntParam>    (juce::ParameterID { ParamID::octaveTranspose, 1 }, "Octave Transpose",  -3, 3, 0));
     layout.add (std::make_unique<FloatParam>  (juce::ParameterID { ParamID::sampleStart, 1 },     "Sample Start",      Range (0.0f, 1.0f),                                     0.0f));
-    layout.add (std::make_unique<FloatParam>  (juce::ParameterID { ParamID::analogAmount, 1 },    "Analog / Doubler Amount", Range (0.0f, 1.0f),                                0.0f));
+    layout.add (std::make_unique<FloatParam>  (juce::ParameterID { ParamID::analogAmount, 1 },    "Analog / Doubler Amount", Range (0.0f, 1.0f, 0.01f),                          0.0f));
     layout.add (std::make_unique<BoolParam>   (juce::ParameterID { ParamID::doublerEnabled, 1 },  "Doubler Mode",      false));
 
     // -------- Voicing ----------------------------------------------------
@@ -203,6 +203,9 @@ XSamplerAudioProcessor::XSamplerAudioProcessor()
 
     for (const auto& id : structuralParams())
         apvts.addParameterListener (id, this);
+    // lfo_depth is "soft-structural": rebuild only when its zero/non-zero
+    // state changes (handled in parameterChanged).
+    apvts.addParameterListener (ParamID::lfoDepth, this);
 
     synth->setNumVoices (32);
     lastNumVoices = 32;
@@ -216,6 +219,7 @@ XSamplerAudioProcessor::~XSamplerAudioProcessor()
     stopTimer();
     for (const auto& id : structuralParams())
         apvts.removeParameterListener (id, this);
+    apvts.removeParameterListener (ParamID::lfoDepth, this);
 }
 
 void XSamplerAudioProcessor::prepareToPlay (double sampleRate, int samplesPerBlock)
@@ -240,7 +244,7 @@ void XSamplerAudioProcessor::prepareToPlay (double sampleRate, int samplesPerBlo
     keyboardState.reset();
     arp.prepare (sampleRate);
     lastCC.fill (-1.0f);
-    doublerPair.fill (-1);
+    heldNoteVel.fill (0);
 }
 
 void XSamplerAudioProcessor::releaseResources() {}
@@ -272,8 +276,15 @@ juce::File XSamplerAudioProcessor::getCurrentSfzFile() const
     return currentSfzFile;
 }
 
-void XSamplerAudioProcessor::parameterChanged (const juce::String& id, float)
+void XSamplerAudioProcessor::parameterChanged (const juce::String& id, float newValue)
 {
+    if (id == ParamID::lfoDepth)
+    {
+        // Rebuild only when the LFO's active state crosses the zero boundary.
+        const bool nowActive = newValue > 0.0001f;
+        if (nowActive == lfoActiveCached) return;
+    }
+
     overlayDirty.store (true, std::memory_order_release);
     lastChangeMs.store (juce::Time::getMillisecondCounter(), std::memory_order_release);
     if (urgentStructuralParams().contains (id))
@@ -333,6 +344,12 @@ void XSamplerAudioProcessor::rebuildAndApplyOverlay()
 
     {
         const juce::ScopedLock sl (synthLock);
+
+        // Flush any active voices before reload — sfizz internal note
+        // bookkeeping won't survive a region-set change cleanly otherwise
+        // (caused hung notes when the doubler was toggled mid-play).
+        synth->allSoundOff();
+
         const bool ok = synth->loadSfzString (
             currentSfzFile.getFullPathName().toStdString(),
             combined.toStdString());
@@ -345,11 +362,20 @@ void XSamplerAudioProcessor::rebuildAndApplyOverlay()
             lastNumVoices = targetVoices;
         }
 
-        // Push the current CC state into sfizz right now so any noteOn
-        // that arrives before the next processBlock already sees correct
-        // ADSR / cutoff / velocity values.
         lastCC.fill (-1.0f);
         flushParamCCs (true);
+
+        // Re-trigger every key the user is currently holding so the change
+        // never feels like it dropped notes.
+        const int octaveShift = (int) pOctaveTranspose->load() * 12;
+        for (int n = 0; n < 128; ++n)
+        {
+            if (heldNoteVel[(size_t) n] > 0)
+            {
+                const int shifted = juce::jlimit (0, 127, n + octaveShift);
+                synth->noteOn (0, shifted, heldNoteVel[(size_t) n]);
+            }
+        }
     }
 }
 
@@ -487,12 +513,16 @@ void XSamplerAudioProcessor::processBlock (juce::AudioBuffer<float>& buffer,
 
         if (msg.isNoteOn())
         {
-            const int note = juce::jlimit (0, 127, msg.getNoteNumber() + octaveShift);
+            const int rawNote = juce::jlimit (0, 127, msg.getNoteNumber());
+            const int note = juce::jlimit (0, 127, rawNote + octaveShift);
+            heldNoteVel[(size_t) rawNote] = (juce::uint8) msg.getVelocity();
             synth->noteOn (sample, note, msg.getVelocity());
         }
         else if (msg.isNoteOff())
         {
-            const int note = juce::jlimit (0, 127, msg.getNoteNumber() + octaveShift);
+            const int rawNote = juce::jlimit (0, 127, msg.getNoteNumber());
+            const int note = juce::jlimit (0, 127, rawNote + octaveShift);
+            heldNoteVel[(size_t) rawNote] = 0;
             synth->noteOff (sample, note, msg.getVelocity());
         }
         else if (msg.isPitchWheel())
@@ -510,6 +540,7 @@ void XSamplerAudioProcessor::processBlock (juce::AudioBuffer<float>& buffer,
         }
         else if (msg.isAllNotesOff() || msg.isAllSoundOff())
         {
+            heldNoteVel.fill (0);
             synth->allSoundOff();
         }
     }

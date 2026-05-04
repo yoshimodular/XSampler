@@ -88,9 +88,10 @@ private:
     // with all-zero depths, hence the gating).
     bool lfoActiveCached { false };
 
-    // Doubler MIDI duplication state. We track each user-played note so
-    // a noteOff sends the matching pair off too.
-    std::array<int, 128> doublerPair {};   // -1 if not played, else paired note number
+    // Track every note currently held at the synth so we can re-trigger
+    // them after an urgent overlay rebuild (which calls allSoundOff to
+    // avoid hung voices). 0 = not held; otherwise stored velocity.
+    std::array<juce::uint8, 128> heldNoteVel {};
 
     // Cached parameter pointers
     std::atomic<float>* pMasterGain      { nullptr };

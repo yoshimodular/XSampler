@@ -839,6 +839,58 @@ struct MonoModeTests : public juce::UnitTest
 };
 
 //==============================================================================
+struct StructuralRebuildHoldNotesTest : public juce::UnitTest
+{
+    StructuralRebuildHoldNotesTest()
+        : juce::UnitTest ("Structural rebuild keeps held notes audible", "XSampler") {}
+
+    void runTest() override
+    {
+        auto p = makePrepared();
+        if (! loadResonant (*p))
+        {
+            beginTest ("Resonant2.sfz available");
+            logMessage ("SKIPPING — SFZ not present");
+            return;
+        }
+
+        beginTest ("Toggling doubler mid-play does not silence held notes");
+        juce::AudioBuffer<float> blk (2, kBlock);
+        juce::MidiBuffer midi;
+        midi.addEvent (juce::MidiMessage::noteOn (1, 60, (juce::uint8) 100), 0);
+
+        // Warm-up: trigger the note.
+        for (int b = 0; b < 6; ++b)
+        {
+            blk.clear();
+            p->processBlock (blk, midi);
+            midi.clear();
+        }
+        const float beforePeak = bufferRMS (blk);
+        logMessage ("RMS before toggle: " + juce::String (beforePeak, 5));
+
+        // Toggle the doubler ON — this must NOT hang the note. With the
+        // re-trigger fix, the note keeps sounding through the rebuild.
+        p->apvts.getParameter ("doubler_enabled")->setValueNotifyingHost (1.0f);
+        p->flushOverlayNow();
+
+        // Render several blocks AFTER the toggle. We expect non-silence
+        // resuming within a few blocks (held-note re-trigger).
+        float maxAfter = 0.0f;
+        for (int b = 0; b < 20; ++b)
+        {
+            blk.clear();
+            juce::MidiBuffer empty;
+            p->processBlock (blk, empty);
+            maxAfter = std::max (maxAfter, bufferRMS (blk));
+        }
+        logMessage ("Max RMS after toggle (20 blocks): " + juce::String (maxAfter, 5));
+        expect (maxAfter > beforePeak * 0.3f,
+                "Held note must remain audible after a structural rebuild");
+    }
+};
+
+//==============================================================================
 struct EditorTests : public juce::UnitTest
 {
     EditorTests() : juce::UnitTest ("Editor lifecycle", "XSampler") {}
@@ -869,6 +921,7 @@ static OverlayParamTests    _t_overlay;
 static ArpTests             _t_arp;
 static SmoothParamTests     _t_smooth;
 static MonoModeTests        _t_mono;
+static StructuralRebuildHoldNotesTest _t_rebuildHold;
 static EditorTests          _t_editor;
 
 int main (int, char**)

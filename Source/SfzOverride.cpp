@@ -157,21 +157,36 @@ juce::String buildSfzWithOverride (const juce::File& originalSfz,
     g << "pitch_random=0\n" << "pitch_random_oncc" << XSamplerCC::PitchRandom << "=10\n"
       << "delay_random=0\n" << "delay_random_oncc" << XSamplerCC::DelayRandom << "=0.003\n";
 
-    // Sample start (offset in samples). 88200 ≈ 2 s at 44.1k — long enough
-    // to be useful for short percussive samples without aliasing for long
-    // sustained ones.
+    // Sample start (offset in samples). 4410 ≈ 100 ms at 44.1k. Smaller
+    // than v0.0.6 so it stays inside the body of short percussive samples;
+    // SFZ has no relative offset, so this is a per-sample compromise.
     g << "offset=0\n"
-      << "offset_oncc" << XSamplerCC::SampleStart << "=88200\n";
-
-    // Legato (per-region trigger). With polyphony=1 + trigger=legato a held
-    // sequence shares envelopes; without legato every note retriggers.
-    if (p.legato && p.mono)
-        g << "trigger=legato\n";
+      << "offset_oncc" << XSamplerCC::SampleStart << "=4410\n";
 
     g << "\n";
 
     // -------- Region body ----------------------------------------------
-    if (! p.doubler)
+    if (p.legato && p.mono)
+    {
+        // Legato: keep polyphony=1 (mono) and emit two region copies —
+        // one with trigger=first (the very first key) and one with
+        // trigger=legato (subsequent overlapping keys, which inherit
+        // the active envelope).
+        const int splitAt = firstSectionHeaderOffset (original);
+        if (splitAt < 0)
+        {
+            g << "trigger=legato\n" << original;
+        }
+        else
+        {
+            const juce::String preamble = original.substring (0, splitAt);
+            const juce::String body     = original.substring (splitAt);
+            g << preamble;
+            g << "<group>\ntrigger=first\n"  << body << "\n";
+            g << "<group>\ntrigger=legato\n" << body << "\n";
+        }
+    }
+    else if (! p.doubler)
     {
         g << original;
     }
