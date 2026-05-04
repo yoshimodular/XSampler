@@ -1,5 +1,6 @@
 #include "SfzOverride.h"
 #include <regex>
+#include <unordered_set>
 
 namespace
 {
@@ -111,6 +112,161 @@ namespace
         }
         return best;
     }
+
+    // Inline every #include directive recursively so the strip pass sees
+    // the full effective SFZ source. Without this, opcodes inside included
+    // map files would shadow our <global> (per-region wins over global)
+    // and our macro knobs would have no audible effect. Banks like the
+    // Aliexpress Erhu legitimately include the same map file from several
+    // <master> blocks — so we DON'T deduplicate, only cap recursion depth.
+    // Walk the file, tracking the active <control> default_path, and
+    // rewrite every `sample=PATH` opcode to an absolute path. Resolution
+    // order:
+    //   1) baseDir / default_path / PATH         (include-relative)
+    //   2) topDir  / default_path / PATH         (top-level relative)
+    // The first one that exists wins; if neither does, we still emit
+    // the include-relative absolute (sfizz will report the missing file).
+    juce::String absolutiseSamplePaths (const juce::String& text,
+                                        const juce::File& baseDir,
+                                        const juce::File& topDir)
+    {
+        // Token-based pass over each opcode `key=value`.
+        const std::regex re (
+            "(^|[\\s\\t])(default_path|sample)=([^\\s\\r\\n]+)",
+            std::regex_constants::icase);
+
+        const std::string in = text.toStdString();
+        std::string out;
+        out.reserve (in.size());
+
+        juce::String defaultPath;  // accumulated default_path
+        auto it  = std::sregex_iterator (in.begin(), in.end(), re);
+        auto end = std::sregex_iterator();
+        std::size_t lastEnd = 0;
+
+        for (; it != end; ++it)
+        {
+            const auto& m = *it;
+            out.append (in, lastEnd, (std::size_t) m.position() - lastEnd);
+
+            juce::String key (m[2].str());
+            juce::String val (m[3].str());
+            val = val.replaceCharacter ('\\', '/');
+
+            if (key.equalsIgnoreCase ("default_path"))
+            {
+                // Bake this in for subsequent samples; drop the opcode.
+                defaultPath = val;
+                if (! defaultPath.endsWith ("/"))
+                    defaultPath << "/";
+                out.append (m[1].str());
+                out.append ("// [absorbed default_path=");
+                out.append (val.toStdString());
+                out.append ("]");
+            }
+            else // sample
+            {
+                juce::File resolved;
+                if (juce::File::isAbsolutePath (val))
+                {
+                    resolved = juce::File (val);
+                }
+                else
+                {
+                    auto tryResolve = [&] (const juce::File& root) {
+                        juce::File r = root;
+                        if (defaultPath.isNotEmpty())
+                            r = r.getChildFile (defaultPath);
+                        return r.getChildFile (val);
+                    };
+                    juce::File a = tryResolve (baseDir);
+                    juce::File b = tryResolve (topDir);
+                    if (a.existsAsFile())      resolved = a;
+                    else if (b.existsAsFile()) resolved = b;
+                    else                       resolved = a; // sfizz will error
+                }
+                out.append (m[1].str());
+                out.append ("sample=");
+                out.append (resolved.getFullPathName().toStdString());
+            }
+
+            lastEnd = (std::size_t) m.position() + (std::size_t) m.length();
+        }
+        out.append (in, lastEnd, in.size() - lastEnd);
+        return juce::String (out);
+    }
+
+    // `pathStack` carries the chain of currently-open files. A re-entry
+    // means the include path is cyclic and we drop the directive (replaced
+    // with a comment) so sfizz never sees it again. Sibling re-includes
+    // are fine because the prior occurrence has already left the stack.
+    juce::String inlineIncludes (const juce::String& text,
+                                 const juce::File& baseFile,
+                                 const juce::File& topFile,
+                                 std::unordered_set<std::string>& pathStack,
+                                 int depth = 0)
+    {
+        if (depth > 16) return juce::String (); // truncate; emit nothing
+
+        const std::regex re ("(^|[\\s\\t])(#include|\\$include)[\\s\\t]+\"([^\"]+)\"");
+        const std::string in = text.toStdString();
+        std::string out;
+        out.reserve (in.size());
+
+        auto it  = std::sregex_iterator (in.begin(), in.end(), re);
+        auto end = std::sregex_iterator();
+        std::size_t lastEnd = 0;
+
+        for (; it != end; ++it)
+        {
+            const auto& m = *it;
+            out.append (in, lastEnd, (std::size_t) m.position() - lastEnd);
+
+            const juce::String includePath (m[3].str());
+            const juce::File inc = baseFile.getParentDirectory().getChildFile (includePath);
+            if (! inc.existsAsFile())
+            {
+                // Drop unresolved includes — sfizz would reject the bank
+                // with a missing-file error. The processor surfaces a
+                // load failure in compatibility tests instead.
+                out.append (m[1].str());
+                out.append (" // [missing include: ");
+                out.append (includePath.toStdString());
+                out.append ("]\n");
+            }
+            else
+            {
+                const std::string canonical = inc.getFullPathName().toStdString();
+                if (pathStack.count (canonical))
+                {
+                    // Cycle on the current path — break it.
+                    out.append (m[1].str());
+                    out.append (" // [cyclic include skipped]\n");
+                }
+                else
+                {
+                    pathStack.insert (canonical);
+                    juce::String childText = inc.loadFileAsString();
+                    childText = absolutiseSamplePaths (
+                        childText,
+                        inc.getParentDirectory(),
+                        topFile.getParentDirectory());
+                    const juce::String inlined = inlineIncludes (
+                        childText, inc, topFile, pathStack, depth + 1);
+                    pathStack.erase (canonical);
+
+                    out.append (m[1].str());
+                    out.append ("\n");
+                    out.append (inlined.toStdString());
+                    out.append ("\n");
+                }
+            }
+
+            lastEnd = (std::size_t) m.position() + (std::size_t) m.length();
+        }
+        out.append (in, lastEnd, in.size() - lastEnd);
+        return juce::String (out);
+    }
 }
 
 juce::String buildSfzWithOverride (const juce::File& originalSfz,
@@ -120,6 +276,14 @@ juce::String buildSfzWithOverride (const juce::File& originalSfz,
         return {};
 
     juce::String original = originalSfz.loadFileAsString();
+
+    const juce::File topDir = originalSfz.getParentDirectory();
+    original = absolutiseSamplePaths (original, topDir, topDir);
+    {
+        std::unordered_set<std::string> pathStack;
+        pathStack.insert (originalSfz.getFullPathName().toStdString());
+        original = inlineIncludes (original, originalSfz, originalSfz, pathStack);
+    }
 
     for (const auto& op : alwaysStripped())
         original = stripOpcode (original, op);

@@ -1,0 +1,60 @@
+{
+  "Name": "XSampler",
+  "Version": "0.0.10",
+  "Factory Info": {
+    "Vendor": "XSampler",
+    "URL": "",
+    "E-Mail": "",
+    "Flags": {
+      "Unicode": true,
+      "Classes Discardable": false,
+      "Component Non Discardable": false,
+    },
+  },
+  "Classes": [
+    {
+      "CID": "ABCDEF019182FAEB5873616D58736D70",
+      "Category": "Audio Module Class",
+      "Name": "XSampler",
+      "Vendor": "XSampler",
+      "Version": "0.0.10",
+      "SDKVersion": "VST 3.7.12",
+      "Sub Categories": [
+        "Instrument",
+        "Synth",
+      ],
+      "Class Flags": 2,
+      "Cardinality": 2147483647,
+      "Snapshots": [
+      ],
+    },
+    {
+      "CID": "ABCDEF011234ABCD5873616D58736D70",
+      "Category": "Component Controller Class",
+      "Name": "XSampler",
+      "Vendor": "XSampler",
+      "Version": "0.0.10",
+      "SDKVersion": "VST 3.7.12",
+      "Sub Categories": [
+        "Instrument",
+        "Synth",
+      ],
+      "Class Flags": 2,
+      "Cardinality": 2147483647,
+      "Snapshots": [
+      ],
+    },
+    {
+      "CID": "ABCDEF01C0DEF00D5873616D58736D70",
+      "Category": "Plugin Compatibility Class",
+      "Name": "XSampler",
+      "Vendor": "XSampler",
+      "Version": "0.0.10",
+      "SDKVersion": "VST 3.7.12",
+      "Class Flags": 0,
+      "Cardinality": 2147483647,
+      "Snapshots": [
+      ],
+    },
+  ],
+}

@@ -44,6 +44,11 @@ public:
     bool loadSfzFile (const juce::File& file);
     juce::File getCurrentSfzFile() const;
 
+    // After loadSfzFile (or any rebuild), this lists every `sample=` path
+    // that didn't resolve to an existing file on disk. UI / hosts can show
+    // the user exactly which samples are missing.
+    juce::StringArray getMissingSamples() const;
+
     // Force-rebuild the overlay synchronously (tests / SFZ load).
     void flushOverlayNow();
 
@@ -70,8 +75,9 @@ private:
     juce::CriticalSection synthLock;
 
     std::atomic<bool> sfzLoaded { false };
-    juce::File   currentSfzFile;
-    juce::String currentSfzText;
+    juce::File        currentSfzFile;
+    juce::String      currentSfzText;
+    juce::StringArray missingSamples;
 
     int    lastNumVoices    { -1 };
     double currentSampleRate{ 44100.0 };

@@ -1,6 +1,7 @@
 #include "PluginProcessor.h"
 #include "PluginEditor.h"
 #include "SfzOverride.h"
+#include <regex>
 
 namespace ParamID
 {
@@ -289,6 +290,11 @@ juce::File XSamplerAudioProcessor::getCurrentSfzFile() const
     return currentSfzFile;
 }
 
+juce::StringArray XSamplerAudioProcessor::getMissingSamples() const
+{
+    return missingSamples;
+}
+
 void XSamplerAudioProcessor::parameterChanged (const juce::String& id, float newValue)
 {
     if (id == ParamID::lfoDepth)
@@ -374,6 +380,25 @@ void XSamplerAudioProcessor::rebuildAndApplyOverlay()
 
     const juce::String combined = buildSfzWithOverride (currentSfzFile, sp);
     if (combined.isEmpty()) return;
+
+    // Scan the combined source for sample paths and record any that don't
+    // exist on disk. UI / hosts can surface this list to the user.
+    {
+        juce::StringArray missing;
+        const std::regex re ("(^|[\\s\\t])sample=([^\\s\\r\\n]+)");
+        const std::string s = combined.toStdString();
+        for (auto it  = std::sregex_iterator (s.begin(), s.end(), re),
+                  end = std::sregex_iterator(); it != end; ++it)
+        {
+            const auto& m = *it;
+            juce::String path (m[2].str());
+            if (! juce::File::isAbsolutePath (path)) continue; // unresolved
+            if (path.startsWith ("*")) continue;               // sfizz oscillator
+            if (! juce::File (path).existsAsFile())
+                missing.addIfNotAlreadyThere (path);
+        }
+        missingSamples = std::move (missing);
+    }
 
     {
         const juce::ScopedLock sl (synthLock);

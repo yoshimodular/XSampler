@@ -1230,6 +1230,162 @@ struct SfzCompatibilityTests : public juce::UnitTest
 };
 
 //==============================================================================
+struct MissingSamplesTest : public juce::UnitTest
+{
+    MissingSamplesTest() : juce::UnitTest ("Missing samples are detected", "XSampler") {}
+    void runTest() override
+    {
+        beginTest ("Healthy SFZ → empty missing list");
+        const juce::File good ("/Users/capitalsound/Library/Mobile Documents/com~apple~CloudDocs/Code/XSampler/SFZ/Resonant2.sfz");
+        if (good.existsAsFile())
+        {
+            auto p = makePrepared();
+            expect (p->loadSfzFile (good));
+            const auto miss = p->getMissingSamples();
+            logMessage ("Resonant2 missing: " + juce::String (miss.size()));
+            expectEquals (miss.size(), 0, "Resonant2 should have no missing samples");
+        }
+
+        beginTest ("Synthetic SFZ with missing sample is reported");
+        auto tmpDir = juce::File::createTempFile ("");
+        tmpDir.createDirectory();
+        auto sfz = tmpDir.getChildFile ("test.sfz");
+        sfz.replaceWithText (
+            "<region>\nsample=does_not_exist.wav\nlokey=60\nhikey=60\npitch_keycenter=60\n");
+
+        auto p = makePrepared();
+        // Note: loadSfzFile may return false if sfizz rejects the bank,
+        // but the missing-samples list should still be populated.
+        p->loadSfzFile (sfz);
+        const auto miss = p->getMissingSamples();
+        expect (miss.size() >= 1, "Missing sample should be reported");
+        bool found = false;
+        for (const auto& s : miss)
+            if (s.contains ("does_not_exist.wav")) found = true;
+        expect (found, "Reported list should include 'does_not_exist.wav'");
+
+        sfz.deleteFile();
+        tmpDir.deleteRecursively();
+    }
+};
+
+struct ControlAudibilityTests : public juce::UnitTest
+{
+    ControlAudibilityTests() : juce::UnitTest ("Controls actually move the audio", "XSampler") {}
+
+    static juce::AudioBuffer<float> renderHold (XSamplerAudioProcessor& p, int note, int blocks)
+    {
+        juce::AudioBuffer<float> blk (2, kBlock);
+        juce::MidiBuffer pre;
+        pre.addEvent (juce::MidiMessage::allNotesOff (1), 0);
+        for (int b = 0; b < 4; ++b)
+        {
+            blk.clear();
+            p.processBlock (blk, pre);
+            pre.clear();
+        }
+        juce::AudioBuffer<float> total (2, blocks * kBlock);
+        total.clear();
+        juce::MidiBuffer m;
+        m.addEvent (juce::MidiMessage::noteOn (1, note, (juce::uint8) 127), 0);
+        for (int b = 0; b < blocks; ++b)
+        {
+            blk.clear();
+            p.processBlock (blk, m);
+            m.clear();
+            for (int ch = 0; ch < 2; ++ch)
+                total.copyFrom (ch, b * kBlock, blk, ch, 0, kBlock);
+        }
+        return total;
+    }
+
+    void runTest() override
+    {
+        const juce::File files[] = {
+            juce::File ("/Users/capitalsound/Library/Mobile Documents/com~apple~CloudDocs/Code/XSampler/SFZ/Resonant2.sfz"),
+            juce::File ("/Users/capitalsound/Library/Mobile Documents/com~apple~CloudDocs/Code/XSampler/TestBanks/erhu/Programs/02-erhu_long.sfz"),
+            juce::File ("/Users/capitalsound/Library/Mobile Documents/com~apple~CloudDocs/Code/XSampler/TestBanks/steeldrum/_jSteelDrum-flac.sfz"),
+        };
+        const char* names[] = { "Resonant2", "Erhu_long", "SteelDrum" };
+
+        for (int i = 0; i < (int) std::size (files); ++i)
+        {
+            const auto& f = files[i];
+            const juce::String n (names[i]);
+            if (! f.existsAsFile())
+            {
+                logMessage ("SKIP " + n + ": file not present");
+                continue;
+            }
+
+            beginTest (n + " — master_gain=0 must silence output");
+            auto p = makePrepared();
+            expect (p->loadSfzFile (f), "Loaded " + n);
+            // Pick a note known to play in each bank.
+            const int testNote = (n == "SteelDrum") ? 60 : 60;
+
+            p->apvts.getParameter ("master_gain")->setValueNotifyingHost (1.0f);
+            auto loud = renderHold (*p, testNote, 30);
+            const float loudRms = bufferRMS (loud);
+
+            p->apvts.getParameter ("master_gain")->setValueNotifyingHost (0.0f);
+            auto silent = renderHold (*p, testNote, 30);
+            const float silentRms = bufferRMS (silent);
+
+            logMessage (n + " gain  loud=" + juce::String (loudRms, 5)
+                        + "  zero=" + juce::String (silentRms, 5));
+            expect (silentRms < loudRms * 0.1f, n + ": master_gain=0 must reduce output by ≥10×");
+
+            beginTest (n + " — filter_cutoff (LP at min must reduce total energy)");
+            p->apvts.getParameter ("master_gain")->setValueNotifyingHost (1.0f);
+            p->apvts.getParameter ("filter_cutoff")->setValueNotifyingHost (1.0f);
+            auto open = renderHold (*p, testNote, 30);
+            const float openRMS = bufferRMS (open);
+            p->apvts.getParameter ("filter_cutoff")->setValueNotifyingHost (0.0f);
+            auto closed = renderHold (*p, testNote, 30);
+            const float closedRMS = bufferRMS (closed);
+            logMessage (n + " RMS  open=" + juce::String (openRMS, 5)
+                        + "  closed=" + juce::String (closedRMS, 5));
+            expect (closedRMS < openRMS * 0.5f,
+                    n + ": LP cutoff at 20 Hz must reduce total RMS ≥2×");
+            p->apvts.getParameter ("filter_cutoff")->setValueNotifyingHost (1.0f);
+
+            beginTest (n + " — long vol_attack delays the onset");
+            p->apvts.getParameter ("vol_attack")->setValueNotifyingHost (0.0f);
+            auto fast = renderHold (*p, testNote, 12);
+            p->apvts.getParameter ("vol_attack")->setValueNotifyingHost (0.7f);
+            auto slow = renderHold (*p, testNote, 12);
+            const int firstMs = (int) (kSR * 0.05);  // 50 ms window
+            const float fastEarly = bufferRMS (fast,  0, firstMs);
+            const float slowEarly = bufferRMS (slow,  0, firstMs);
+            logMessage (n + " attack-early  fast=" + juce::String (fastEarly, 5)
+                        + "  slow=" + juce::String (slowEarly, 5));
+            expect (fastEarly > slowEarly * 2.0f,
+                    n + ": slower attack must lower energy in the first 50 ms ≥2×");
+            p->apvts.getParameter ("vol_attack")->setValueNotifyingHost (0.0f);
+
+            beginTest (n + " — tune_global ±100c decorrelates audio");
+            p->apvts.getParameter ("tune_global")->setValueNotifyingHost (0.5f); // 0c
+            auto t0 = renderHold (*p, testNote, 8);
+            p->apvts.getParameter ("tune_global")->setValueNotifyingHost (1.0f); // +100c
+            auto t1 = renderHold (*p, testNote, 8);
+            const int N = juce::jmin (t0.getNumSamples(), t1.getNumSamples());
+            double dot = 0, n0 = 0, n1 = 0;
+            for (int j = 0; j < N; ++j)
+            {
+                const float a = t0.getReadPointer (0)[j];
+                const float b = t1.getReadPointer (0)[j];
+                dot += a * b; n0 += a * a; n1 += b * b;
+            }
+            const double corr = (n0 > 0 && n1 > 0) ? dot / std::sqrt (n0 * n1) : 1.0;
+            logMessage (n + " tune corr 0 vs +100c: " + juce::String (corr, 4));
+            expect (corr < 0.95, n + ": +100c tune must decorrelate the signal");
+            p->apvts.getParameter ("tune_global")->setValueNotifyingHost (0.5f);
+        }
+    }
+};
+
+//==============================================================================
 struct EditorTests : public juce::UnitTest
 {
     EditorTests() : juce::UnitTest ("Editor lifecycle", "XSampler") {}
@@ -1263,6 +1419,8 @@ static MonoModeTests        _t_mono;
 static StructuralRebuildHoldNotesTest _t_rebuildHold;
 static PortamentoTests      _t_porta;
 static SfzCompatibilityTests _t_compat;
+static MissingSamplesTest   _t_missing;
+static ControlAudibilityTests _t_ctrl;
 static EditorTests          _t_editor;
 
 int main (int, char**)
