@@ -203,12 +203,19 @@ struct StateRoundTripTests : public juce::UnitTest
 
     void runTest() override
     {
-        beginTest ("APVTS values survive get/setStateInformation");
+        beginTest ("Knob values do NOT persist across sessions (defaults only)");
+        beginTest ("Only the SFZ path is restored");
 
         auto a = makePrepared();
-        a->apvts.getParameter ("master_gain")->setValueNotifyingHost (0.123f);
-        a->apvts.getParameter ("filter_cutoff")->setValueNotifyingHost (0.5f);
-        a->apvts.getParameter ("voice_mode")->setValueNotifyingHost (1.0f); // Mono
+        // Tweak some knobs that should be wiped on session restore.
+        a->apvts.getParameter ("master_gain")->setValueNotifyingHost (0.1f);
+        a->apvts.getParameter ("filter_cutoff")->setValueNotifyingHost (0.0f);
+        a->apvts.getParameter ("voice_mode")->setValueNotifyingHost (1.0f);
+
+        // Need a path to "save" — write a tiny SFZ.
+        auto tmp = juce::File::createTempFile ("xsampler_state.sfz");
+        tmp.replaceWithText ("<region>sample=*sine\n");
+        a->loadSfzFile (tmp);
 
         juce::MemoryBlock blob;
         a->getStateInformation (blob);
@@ -216,13 +223,20 @@ struct StateRoundTripTests : public juce::UnitTest
         auto b = makePrepared();
         b->setStateInformation (blob.getData(), (int) blob.getSize());
 
-        expectWithinAbsoluteError (a->apvts.getRawParameterValue ("master_gain")->load(),
-                                   b->apvts.getRawParameterValue ("master_gain")->load(),
-                                   1.0e-4f);
-        expectWithinAbsoluteError (a->apvts.getRawParameterValue ("filter_cutoff")->load(),
-                                   b->apvts.getRawParameterValue ("filter_cutoff")->load(),
-                                   1.0e-2f);
-        expectEquals ((int) b->apvts.getRawParameterValue ("voice_mode")->load(), 1);
+        // SFZ path restored.
+        expect (b->getCurrentSfzFile() == tmp, "Restored processor should reload the same SFZ file");
+
+        // Knob values are at DEFAULTS, not the tweaked values.
+        const float gainDefault   = 0.8f;
+        const float cutoffDefault = 8000.0f;
+        expectWithinAbsoluteError (b->apvts.getRawParameterValue ("master_gain")->load(),
+                                   gainDefault, 1.0e-4f, "master_gain should be back to default");
+        expectWithinAbsoluteError (b->apvts.getRawParameterValue ("filter_cutoff")->load(),
+                                   cutoffDefault, 1.0f, "filter_cutoff should be back to default");
+        expectEquals ((int) b->apvts.getRawParameterValue ("voice_mode")->load(), 0,
+                      "voice_mode should be back to Poly");
+
+        tmp.deleteFile();
     }
 };
 

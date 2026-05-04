@@ -486,11 +486,15 @@ juce::AudioProcessorEditor* XSamplerAudioProcessor::createEditor()
 
 void XSamplerAudioProcessor::getStateInformation (juce::MemoryBlock& destData)
 {
-    auto state = apvts.copyState();
+    // Only persist the loaded SFZ path. All knob values reset to their
+    // declared defaults on every session load — that's deliberate while
+    // the engine is stabilising, so the user always starts from a known
+    // audible state.
+    juce::ValueTree tree ("XSamplerSession");
     if (currentSfzFile.existsAsFile())
-        state.setProperty ("sfzPath", currentSfzFile.getFullPathName(), nullptr);
+        tree.setProperty ("sfzPath", currentSfzFile.getFullPathName(), nullptr);
 
-    if (auto xml = state.createXml())
+    if (auto xml = tree.createXml())
         copyXmlToBinary (*xml, destData);
 }
 
@@ -499,15 +503,13 @@ void XSamplerAudioProcessor::setStateInformation (const void* data, int sizeInBy
     if (auto xml = getXmlFromBinary (data, sizeInBytes))
     {
         auto tree = juce::ValueTree::fromXml (*xml);
-        if (tree.isValid())
+        if (! tree.isValid()) return;
+
+        const auto path = tree.getProperty ("sfzPath").toString();
+        if (path.isNotEmpty())
         {
-            apvts.replaceState (tree);
-            const auto path = tree.getProperty ("sfzPath").toString();
-            if (path.isNotEmpty())
-            {
-                juce::File f (path);
-                if (f.existsAsFile()) loadSfzFile (f);
-            }
+            juce::File f (path);
+            if (f.existsAsFile()) loadSfzFile (f);
         }
     }
 }
