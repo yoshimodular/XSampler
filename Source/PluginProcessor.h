@@ -64,6 +64,7 @@ private:
     void flushParamCCs (bool forceAll);
     void applyArpSettingsFromParams();
     void applyMasterGain (juce::AudioBuffer<float>& buffer);
+    void applySfzAuthoredDefaultsToMacros (const struct XSamplerSfzDefaults&);
 
     // Portamento helpers
     float computePortamentoSeconds (double bpm) const;
@@ -97,9 +98,13 @@ private:
     // True when LFO depth crosses 0 → triggers an overlay rebuild so the
     // LFO opcodes are added/removed (sfizz silences if LFO is declared
     // with all-zero depths, hence the gating).
-    bool lfoActiveCached { false };
+    bool lfoActiveCached    { false };
+    bool filterActiveCached { false };
 
 public:
+    // For test diagnostics only.
+    sfz::Sfizz& getRawSynth() { return *synth; }
+
     // ---- Portamento engine state (public for tests; not for production use)
     int   portaLastNote        { -1 };
     float portaCurrentSemis    { 0.0f };

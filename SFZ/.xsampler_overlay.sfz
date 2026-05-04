@@ -1,0 +1,58 @@
+// Created with Renoise Redux - http://www.renoise.com
+
+<region>
+sample=Resonant2 Samples/B_ResMap3_C-1.flac
+pitch_keycenter=12
+lokey=0 hikey=23
+transpose=12
+volume=11.359149
+
+<region>
+sample=Resonant2 Samples/B_ResMap3_C-2.flac
+pitch_keycenter=24
+lokey=24 hikey=35
+transpose=12
+volume=11.359149
+
+<region>
+sample=Resonant2 Samples/B_ResMap3_C-3.flac
+pitch_keycenter=36
+lokey=36 hikey=47
+transpose=12
+volume=11.359149
+
+<region>
+sample=Resonant2 Samples/B_ResMap3_C-4.flac
+pitch_keycenter=48
+lokey=48 hikey=59
+transpose=12
+volume=11.359149
+
+<region>
+sample=Resonant2 Samples/B_ResMap3_C-5.flac
+lokey=60 hikey=71
+transpose=12
+volume=11.359149
+
+<region>
+sample=Resonant2 Samples/B_ResMap3_C-6.flac
+pitch_keycenter=72
+lokey=72 hikey=83
+transpose=12
+volume=11.359149
+
+<region>
+sample=Resonant2 Samples/B_ResMap3_C-7.flac
+pitch_keycenter=84
+lokey=84 hikey=95
+transpose=12
+tune=10
+volume=11.359149
+
+<region>
+sample=Resonant2 Samples/B_ResMap3_C-8.flac
+pitch_keycenter=96
+lokey=96 hikey=119
+transpose=12
+tune=6
+volume=11.359149

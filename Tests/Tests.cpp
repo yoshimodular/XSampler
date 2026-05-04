@@ -1230,6 +1230,247 @@ struct SfzCompatibilityTests : public juce::UnitTest
 };
 
 //==============================================================================
+// The single most important compatibility test: load each top-level
+// instrument with vanilla sfizz (no overlay), render a fixed MIDI
+// sequence, then load with our processor at defaults and render the
+// same sequence. The two outputs MUST cross-correlate near 1.0 — at
+// defaults, every macro knob must be neutral so the user hears the
+// instrument exactly as the author wrote it.
+struct VanillaVsOverlayTest : public juce::UnitTest
+{
+    VanillaVsOverlayTest() : juce::UnitTest ("Vanilla vs overlay parity", "XSampler") {}
+
+    static juce::AudioBuffer<float> renderVanilla (const juce::File& sfz, int note, int blocks)
+    {
+        sfz::Sfizz s;
+        s.setSampleRate ((float) kSR);
+        s.setSamplesPerBlock (kBlock);
+        s.setNumVoices (32);
+        s.loadSfzFile (sfz.getFullPathName().toStdString());
+
+        juce::AudioBuffer<float> total (2, blocks * kBlock);
+        total.clear();
+        float Lbuf[kBlock] = {0}, Rbuf[kBlock] = {0};
+        float* outs[2] = { Lbuf, Rbuf };
+
+        s.noteOn (0, note, 100);
+        for (int b = 0; b < blocks; ++b)
+        {
+            for (int i = 0; i < kBlock; ++i) Lbuf[i] = Rbuf[i] = 0;
+            s.renderBlock (outs, kBlock, 1);
+            for (int i = 0; i < kBlock; ++i)
+            {
+                total.getWritePointer (0)[b * kBlock + i] = Lbuf[i];
+                total.getWritePointer (1)[b * kBlock + i] = Rbuf[i];
+            }
+        }
+        return total;
+    }
+
+    static juce::AudioBuffer<float> renderOverlay (const juce::File& sfz, int note, int blocks)
+    {
+        auto p = makePrepared();
+        p->loadSfzFile (sfz);
+
+        juce::AudioBuffer<float> total (2, blocks * kBlock);
+        total.clear();
+        juce::AudioBuffer<float> blk (2, kBlock);
+        juce::MidiBuffer m;
+        m.addEvent (juce::MidiMessage::noteOn (1, note, (juce::uint8) 100), 0);
+        for (int b = 0; b < blocks; ++b)
+        {
+            blk.clear();
+            p->processBlock (blk, m);
+            m.clear();
+            for (int ch = 0; ch < 2; ++ch)
+                total.copyFrom (ch, b * kBlock, blk, ch, 0, kBlock);
+        }
+        return total;
+    }
+
+    // Bypass processBlock entirely — call sfizz directly via the processor.
+    // If this matches vanilla, the issue is in processBlock; if not, in
+    // loadSfzString / overlay generation.
+    static juce::AudioBuffer<float> renderRaw (const juce::File& sfz, int note, int blocks)
+    {
+        // Use the processor's sfz::Sfizz instance but call loadSfzFile
+        // directly (vanilla style) — bypassing our overlay path entirely.
+        // If correlation now matches vanilla, the issue is loadSfzString.
+        auto p = makePrepared();
+        auto& s = p->getRawSynth();
+        s.loadSfzFile (sfz.getFullPathName().toStdString());
+
+        juce::AudioBuffer<float> total (2, blocks * kBlock);
+        total.clear();
+        float Lbuf[kBlock] = {0}, Rbuf[kBlock] = {0};
+        float* outs[2] = { Lbuf, Rbuf };
+        s.noteOn (0, note, 100);
+        for (int b = 0; b < blocks; ++b)
+        {
+            for (int i = 0; i < kBlock; ++i) Lbuf[i] = Rbuf[i] = 0;
+            s.renderBlock (outs, kBlock, 1);
+            for (int i = 0; i < kBlock; ++i)
+            {
+                total.getWritePointer (0)[b * kBlock + i] = Lbuf[i];
+                total.getWritePointer (1)[b * kBlock + i] = Rbuf[i];
+            }
+        }
+        return total;
+    }
+
+    static double crossCorrelation (const juce::AudioBuffer<float>& a,
+                                    const juce::AudioBuffer<float>& b)
+    {
+        const int N = juce::jmin (a.getNumSamples(), b.getNumSamples());
+        double dot = 0, na = 0, nb = 0;
+        for (int ch = 0; ch < juce::jmin (a.getNumChannels(), b.getNumChannels()); ++ch)
+        {
+            auto* pa = a.getReadPointer (ch);
+            auto* pb = b.getReadPointer (ch);
+            for (int i = 0; i < N; ++i)
+            {
+                dot += pa[i] * pb[i];
+                na  += pa[i] * pa[i];
+                nb  += pb[i] * pb[i];
+            }
+        }
+        if (na <= 0 || nb <= 0) return 0.0;
+        return dot / std::sqrt (na * nb);
+    }
+
+    // Allow an integer sample SHIFT and try a range to find the best alignment.
+    static std::pair<double, int> bestShiftedCorrelation (
+        const juce::AudioBuffer<float>& a,
+        const juce::AudioBuffer<float>& b,
+        int maxShift = 256)
+    {
+        double best = -2; int bestShift = 0;
+        for (int sh = -maxShift; sh <= maxShift; ++sh)
+        {
+            const int N = juce::jmin (a.getNumSamples(), b.getNumSamples()) - std::abs (sh);
+            if (N <= 0) continue;
+            double dot = 0, na = 0, nb = 0;
+            for (int ch = 0; ch < juce::jmin (a.getNumChannels(), b.getNumChannels()); ++ch)
+            {
+                auto* pa = a.getReadPointer (ch);
+                auto* pb = b.getReadPointer (ch);
+                for (int i = 0; i < N; ++i)
+                {
+                    const float va = pa[i + (sh > 0 ? sh : 0)];
+                    const float vb = pb[i + (sh < 0 ? -sh : 0)];
+                    dot += va * vb;
+                    na  += va * va;
+                    nb  += vb * vb;
+                }
+            }
+            const double c = (na > 0 && nb > 0) ? dot / std::sqrt (na * nb) : 0.0;
+            if (c > best) { best = c; bestShift = sh; }
+        }
+        return { best, bestShift };
+    }
+
+    static void compareFirstSamples (const juce::AudioBuffer<float>& a,
+                                     const juce::AudioBuffer<float>& b,
+                                     juce::String name)
+    {
+        auto* ap = a.getReadPointer (0);
+        auto* bp = b.getReadPointer (0);
+        const int N = juce::jmin (a.getNumSamples(), b.getNumSamples());
+        // Find first non-zero sample in each.
+        int aFirst = -1, bFirst = -1;
+        for (int i = 0; i < N && (aFirst < 0 || bFirst < 0); ++i)
+        {
+            if (aFirst < 0 && std::abs (ap[i]) > 1.0e-6f) aFirst = i;
+            if (bFirst < 0 && std::abs (bp[i]) > 1.0e-6f) bFirst = i;
+        }
+        std::cerr << name.toStdString()
+                  << " vanilla 1st-non-zero@" << aFirst
+                  << " overlay 1st-non-zero@" << bFirst << "\n";
+        // First 8 samples post-onset
+        const int from = juce::jmax (0, juce::jmin (aFirst, bFirst));
+        std::cerr << "  vanilla[" << from << "..]: ";
+        for (int i = from; i < from + 8 && i < N; ++i)
+            std::cerr << ap[i] << " ";
+        std::cerr << "\n  overlay[" << from << "..]: ";
+        for (int i = from; i < from + 8 && i < N; ++i)
+            std::cerr << bp[i] << " ";
+        std::cerr << "\n";
+    }
+
+    void testFile (const juce::File& sfz, juce::String name, int testNote)
+    {
+        beginTest (name + " — vanilla and overlay produce equivalent audio at defaults");
+        if (! sfz.existsAsFile())
+        {
+            logMessage ("SKIP: " + name + " not present");
+            return;
+        }
+
+        auto vanilla = renderVanilla (sfz, testNote, 30);
+        auto ovly    = renderOverlay (sfz, testNote, 30);
+        auto raw     = renderRaw     (sfz, testNote, 30);
+
+        const float vanillaRMS = bufferRMS (vanilla);
+        const float overlayRMS = bufferRMS (ovly);
+        const double corr      = crossCorrelation (vanilla, ovly);
+        const double rawCorr   = crossCorrelation (vanilla, raw);
+        const auto   shifted   = bestShiftedCorrelation (vanilla, ovly);
+        logMessage (name + " RAW corr=" + juce::String (rawCorr, 4)
+                    + "  best-shifted-corr=" + juce::String (shifted.first, 4)
+                    + " (shift=" + juce::String (shifted.second) + ")");
+        // Overlay's master_gain default is 0.8 → expect overlay ≈ vanilla*0.8
+        const double rmsRatio  = (vanillaRMS > 0) ? (overlayRMS / vanillaRMS) : 0;
+
+        logMessage (name
+                    + "  vanillaRMS=" + juce::String (vanillaRMS, 5)
+                    + "  overlayRMS=" + juce::String (overlayRMS, 5)
+                    + "  ratio="      + juce::String (rmsRatio, 3)
+                    + "  corr="       + juce::String (corr,     4));
+
+        compareFirstSamples (vanilla, ovly, name);
+        expect (vanillaRMS > 1.0e-4f, name + ": vanilla render must be audible");
+        expect (corr > 0.95,
+                name + ": overlay must produce audio that cross-correlates ≥ 0.95 with vanilla "
+                       "at default settings (got " + juce::String (corr, 4) + ")");
+    }
+
+    void runTest() override
+    {
+        const juce::File files[] = {
+            juce::File ("/Users/capitalsound/Library/Mobile Documents/com~apple~CloudDocs/Code/XSampler/SFZ/Resonant2.sfz"),
+            juce::File ("/Users/capitalsound/Library/Mobile Documents/com~apple~CloudDocs/Code/XSampler/TestBanks/erhu/Programs/02-erhu_long.sfz"),
+            juce::File ("/Users/capitalsound/Library/Mobile Documents/com~apple~CloudDocs/Code/XSampler/TestBanks/erhu/Programs/03-erhu_short.sfz"),
+            juce::File ("/Users/capitalsound/Library/Mobile Documents/com~apple~CloudDocs/Code/XSampler/TestBanks/steeldrum/_jSteelDrum-flac.sfz"),
+        };
+        const char* names[] = { "Resonant2", "Erhu_long", "Erhu_short", "SteelDrum" };
+        const int   notes[] = { 60,          60,           60,            60 };
+
+        for (int i = 0; i < (int) std::size (files); ++i)
+            testFile (files[i], names[i], notes[i]);
+    }
+};
+
+struct DumpInlinedTest : public juce::UnitTest
+{
+    DumpInlinedTest() : juce::UnitTest ("DEBUG dump inlined", "XSampler") {}
+    void runTest() override {
+        beginTest ("dump");
+        for (auto path : juce::StringArray {
+            "/Users/capitalsound/Library/Mobile Documents/com~apple~CloudDocs/Code/XSampler/SFZ/Resonant2.sfz",
+            "/Users/capitalsound/Library/Mobile Documents/com~apple~CloudDocs/Code/XSampler/TestBanks/erhu/Programs/02-erhu_long.sfz",
+            "/Users/capitalsound/Library/Mobile Documents/com~apple~CloudDocs/Code/XSampler/TestBanks/steeldrum/_jSteelDrum-flac.sfz" })
+        {
+            juce::File f (path);
+            if (! f.existsAsFile()) continue;
+            XSamplerSfzParams sp;
+            auto s = buildSfzWithOverride (f, sp);
+            auto out = juce::File ("/tmp/" + f.getFileNameWithoutExtension() + "_inlined.sfz");
+            out.replaceWithText (s);
+            logMessage ("Wrote " + out.getFullPathName() + " (" + juce::String (s.length()) + " chars)");
+        }
+    }
+};
+
 struct MissingSamplesTest : public juce::UnitTest
 {
     MissingSamplesTest() : juce::UnitTest ("Missing samples are detected", "XSampler") {}
@@ -1420,6 +1661,8 @@ static MonoModeTests        _t_mono;
 static StructuralRebuildHoldNotesTest _t_rebuildHold;
 static PortamentoTests      _t_porta;
 static SfzCompatibilityTests _t_compat;
+static DumpInlinedTest      _t_dump;
+static VanillaVsOverlayTest _t_parity;
 static MissingSamplesTest   _t_missing;
 static ControlAudibilityTests _t_ctrl;
 static EditorTests          _t_editor;

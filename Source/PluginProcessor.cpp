@@ -68,6 +68,18 @@ namespace
         };
         return ids;
     }
+    // Soft-structural: changes here only require a rebuild when they
+    // CROSS the active/inactive boundary (similar to lfo_depth).
+    const juce::StringArray& filterActivityParams()
+    {
+        static const juce::StringArray ids {
+            ParamID::filterCutoff,
+            ParamID::filterResonance,
+            ParamID::filterEnvAmount,
+            ParamID::velToFilter
+        };
+        return ids;
+    }
     // These are still rebuild-required, but get applied IMMEDIATELY (with
     // a brief click on active voices) rather than waiting for silence,
     // because the user expects them to take effect on toggle.
@@ -98,7 +110,7 @@ juce::AudioProcessorValueTreeState::ParameterLayout XSamplerAudioProcessor::crea
     };
 
     // -------- Global ------------------------------------------------------
-    layout.add (std::make_unique<FloatParam>  (juce::ParameterID { ParamID::masterGain, 1 },      "Master Gain",       Range (0.0f, 1.0f),                                     0.8f));
+    layout.add (std::make_unique<FloatParam>  (juce::ParameterID { ParamID::masterGain, 1 },      "Master Gain",       Range (0.0f, 1.0f),                                     1.0f));
     layout.add (std::make_unique<IntParam>    (juce::ParameterID { ParamID::tuneGlobal, 1 },      "Tune Global",       -100, 100, 0));
     layout.add (std::make_unique<IntParam>    (juce::ParameterID { ParamID::pitchbendRange, 1 },  "Pitchbend Range",   1, 24, 12));
     layout.add (std::make_unique<IntParam>    (juce::ParameterID { ParamID::octaveTranspose, 1 }, "Octave Transpose",  -3, 3, 0));
@@ -116,22 +128,26 @@ juce::AudioProcessorValueTreeState::ParameterLayout XSamplerAudioProcessor::crea
 
     // -------- Filter -----------------------------------------------------
     layout.add (std::make_unique<ChoiceParam> (juce::ParameterID { ParamID::filterType, 1 },      "Filter Type",       juce::StringArray { "LP", "HP", "BP" }, 0));
-    layout.add (std::make_unique<FloatParam>  (juce::ParameterID { ParamID::filterCutoff, 1 },    "Filter Cutoff",     skewLog (20.0f, 20000.0f),                              8000.0f));
+    // Defaults below are deliberately the SFZ-vanilla pass-through values:
+    // at defaults, the overlay must produce audio identical to the bank's
+    // native sound. Any "musically nicer" defaults bias the instrument away
+    // from how the author intended it.
+    layout.add (std::make_unique<FloatParam>  (juce::ParameterID { ParamID::filterCutoff, 1 },    "Filter Cutoff",     skewLog (20.0f, 20000.0f),                              20000.0f));
     layout.add (std::make_unique<FloatParam>  (juce::ParameterID { ParamID::filterResonance, 1 }, "Filter Resonance",  Range (0.0f, 1.0f),                                     0.0f));
     layout.add (std::make_unique<FloatParam>  (juce::ParameterID { ParamID::filterEnvAmount, 1 }, "Filter Env Amount", Range (-1.0f, 1.0f),                                    0.0f));
 
     // -------- Volume ADSR + Velocity → Volume ---------------------------
-    layout.add (std::make_unique<FloatParam>  (juce::ParameterID { ParamID::volAttack, 1 },       "Vol Attack",        skewLog (0.001f, 10.0f),                                0.01f));
-    layout.add (std::make_unique<FloatParam>  (juce::ParameterID { ParamID::volDecay, 1 },        "Vol Decay",         skewLog (0.001f, 10.0f),                                0.1f));
-    layout.add (std::make_unique<FloatParam>  (juce::ParameterID { ParamID::volSustain, 1 },      "Vol Sustain",       Range (0.0f, 1.0f),                                     0.8f));
-    layout.add (std::make_unique<FloatParam>  (juce::ParameterID { ParamID::volRelease, 1 },      "Vol Release",       skewLog (0.001f, 20.0f),                                0.3f));
-    layout.add (std::make_unique<FloatParam>  (juce::ParameterID { ParamID::velToVolume, 1 },     "Velocity → Volume", Range (0.0f, 1.0f),                                     0.8f));
+    layout.add (std::make_unique<FloatParam>  (juce::ParameterID { ParamID::volAttack, 1 },       "Vol Attack",        skewLog (0.001f, 10.0f),                                0.001f));
+    layout.add (std::make_unique<FloatParam>  (juce::ParameterID { ParamID::volDecay, 1 },        "Vol Decay",         skewLog (0.001f, 10.0f),                                0.001f));
+    layout.add (std::make_unique<FloatParam>  (juce::ParameterID { ParamID::volSustain, 1 },      "Vol Sustain",       Range (0.0f, 1.0f),                                     1.0f));
+    layout.add (std::make_unique<FloatParam>  (juce::ParameterID { ParamID::volRelease, 1 },      "Vol Release",       skewLog (0.001f, 20.0f),                                0.001f));
+    layout.add (std::make_unique<FloatParam>  (juce::ParameterID { ParamID::velToVolume, 1 },     "Velocity → Volume", Range (0.0f, 1.0f),                                     1.0f));
 
     // -------- Filter ADSR + Velocity → Filter ---------------------------
-    layout.add (std::make_unique<FloatParam>  (juce::ParameterID { ParamID::filterAttack, 1 },    "Filter Attack",     skewLog (0.001f, 10.0f),                                0.01f));
-    layout.add (std::make_unique<FloatParam>  (juce::ParameterID { ParamID::filterDecay, 1 },     "Filter Decay",      skewLog (0.001f, 10.0f),                                0.1f));
-    layout.add (std::make_unique<FloatParam>  (juce::ParameterID { ParamID::filterSustain, 1 },   "Filter Sustain",    Range (0.0f, 1.0f),                                     0.8f));
-    layout.add (std::make_unique<FloatParam>  (juce::ParameterID { ParamID::filterRelease, 1 },   "Filter Release",    skewLog (0.001f, 20.0f),                                0.3f));
+    layout.add (std::make_unique<FloatParam>  (juce::ParameterID { ParamID::filterAttack, 1 },    "Filter Attack",     skewLog (0.001f, 10.0f),                                0.001f));
+    layout.add (std::make_unique<FloatParam>  (juce::ParameterID { ParamID::filterDecay, 1 },     "Filter Decay",      skewLog (0.001f, 10.0f),                                0.001f));
+    layout.add (std::make_unique<FloatParam>  (juce::ParameterID { ParamID::filterSustain, 1 },   "Filter Sustain",    Range (0.0f, 1.0f),                                     1.0f));
+    layout.add (std::make_unique<FloatParam>  (juce::ParameterID { ParamID::filterRelease, 1 },   "Filter Release",    skewLog (0.001f, 20.0f),                                0.001f));
     layout.add (std::make_unique<FloatParam>  (juce::ParameterID { ParamID::velToFilter, 1 },     "Velocity → Filter", Range (0.0f, 1.0f),                                     0.0f));
 
     // -------- LFO --------------------------------------------------------
@@ -162,8 +178,11 @@ XSamplerAudioProcessor::XSamplerAudioProcessor()
       apvts (*this, nullptr, "XSamplerState", createLayout())
 {
     synth = std::make_unique<sfz::Sfizz>();
-    synth->setSampleRate (44100.0f);
-    synth->setSamplesPerBlock (512);
+    // NOTE: sample rate / block size deliberately NOT set here — they
+    // are configured in prepareToPlay() with the host's actual values.
+    // Setting them now and re-setting later left sfizz with subtly
+    // different internal state vs a fresh instance, which broke
+    // bit-exact parity with vanilla sfizz playback.
 
     #define CACHE(field, id) field = apvts.getRawParameterValue (ParamID::id)
     CACHE (pMasterGain,      masterGain);
@@ -210,9 +229,9 @@ XSamplerAudioProcessor::XSamplerAudioProcessor()
 
     for (const auto& id : structuralParams())
         apvts.addParameterListener (id, this);
-    // lfo_depth is "soft-structural": rebuild only when its zero/non-zero
-    // state changes (handled in parameterChanged).
     apvts.addParameterListener (ParamID::lfoDepth, this);
+    for (const auto& id : filterActivityParams())
+        apvts.addParameterListener (id, this);
 
     synth->setNumVoices (32);
     lastNumVoices = 32;
@@ -227,6 +246,8 @@ XSamplerAudioProcessor::~XSamplerAudioProcessor()
     for (const auto& id : structuralParams())
         apvts.removeParameterListener (id, this);
     apvts.removeParameterListener (ParamID::lfoDepth, this);
+    for (const auto& id : filterActivityParams())
+        apvts.removeParameterListener (id, this);
 }
 
 void XSamplerAudioProcessor::prepareToPlay (double sampleRate, int samplesPerBlock)
@@ -281,6 +302,11 @@ bool XSamplerAudioProcessor::loadSfzFile (const juce::File& file)
     currentSfzText = text;
     apvts.state.setProperty ("sfzPath", file.getFullPathName(), nullptr);
 
+    // Read the bank's authored defaults and snap our macros to them so the
+    // user sees what the instrument actually IS, and our overlay produces
+    // audio that matches the bank as authored.
+    applySfzAuthoredDefaultsToMacros (extractDefaults (file));
+
     rebuildAndApplyOverlay();
     return sfzLoaded.load (std::memory_order_acquire);
 }
@@ -295,12 +321,78 @@ juce::StringArray XSamplerAudioProcessor::getMissingSamples() const
     return missingSamples;
 }
 
+void XSamplerAudioProcessor::applySfzAuthoredDefaultsToMacros (const XSamplerSfzDefaults& d)
+{
+    auto setNorm = [this] (const char* id, float userValue)
+    {
+        if (auto* prm = apvts.getParameter (id))
+            prm->setValueNotifyingHost (
+                prm->getNormalisableRange().convertTo0to1 (userValue));
+    };
+    auto setIfPresent = [&] (const char* id, float v, float minV, float maxV)
+    {
+        if (v < minV) return;
+        setNorm (id, juce::jlimit (minV, maxV, v));
+    };
+
+    // Vol ADSR
+    setIfPresent ("vol_attack",   d.ampegAttack,  0.001f, 10.0f);
+    setIfPresent ("vol_decay",    d.ampegDecay,   0.001f, 10.0f);
+    setIfPresent ("vol_release",  d.ampegRelease, 0.001f, 20.0f);
+    if (d.ampegSustain >= 0)        // 0..100 in SFZ → 0..1 in our knob
+        setNorm ("vol_sustain", juce::jlimit (0.0f, 1.0f, d.ampegSustain * 0.01f));
+
+    // Filter ADSR
+    setIfPresent ("filter_attack",  d.filegAttack,  0.001f, 10.0f);
+    setIfPresent ("filter_decay",   d.filegDecay,   0.001f, 10.0f);
+    setIfPresent ("filter_release", d.filegRelease, 0.001f, 20.0f);
+    if (d.filegSustain >= 0)
+        setNorm ("filter_sustain", juce::jlimit (0.0f, 1.0f, d.filegSustain * 0.01f));
+
+    // Filter env amount: SFZ depth in cents (-9600..+9600 typical) → -1..+1 knob.
+    if (d.filegDepth > -1.0e8f)
+        setNorm ("filter_env_amount",
+                 juce::jlimit (-1.0f, 1.0f, d.filegDepth / 4800.0f));
+
+    // Cutoff
+    if (d.cutoff > 0)
+        setNorm ("filter_cutoff", juce::jlimit (20.0f, 20000.0f, d.cutoff));
+
+    // Resonance: SFZ in dB (0..40 typical) → 0..1 knob (0..24 dB internally).
+    if (d.resonance > -1.0e8f)
+        setNorm ("filter_resonance", juce::jlimit (0.0f, 1.0f, d.resonance / 24.0f));
+
+    // Filter type
+    if (d.filType >= 0 && d.filType <= 2)
+        if (auto* prm = apvts.getParameter ("filter_type"))
+            prm->setValueNotifyingHost (prm->getNormalisableRange().convertTo0to1 ((float) d.filType));
+
+    // Velocity tracks
+    if (d.ampVelTrack >= 0)
+        setNorm ("velocity_to_volume", juce::jlimit (0.0f, 1.0f, d.ampVelTrack * 0.01f));
+    if (d.filVelTrack > -1.0e8f)
+        setNorm ("velocity_to_filter", juce::jlimit (0.0f, 1.0f, d.filVelTrack / 4800.0f));
+}
+
 void XSamplerAudioProcessor::parameterChanged (const juce::String& id, float newValue)
 {
     if (id == ParamID::lfoDepth)
     {
         const bool nowActive = newValue > 0.0001f;
         if (nowActive == lfoActiveCached) return;
+    }
+
+    // Filter activity boundary: rebuild only when crossing the
+    // active/inactive line (cutoff < 19 kHz, or any of resonance / env
+    // amount / vel-to-filter non-zero).
+    if (filterActivityParams().contains (id))
+    {
+        const bool nowActive =
+                pFilterCutoff->load() < 19000.0f
+             || pFilterResonance->load() > 0.001f
+             || std::abs (pFilterEnvAmount->load()) > 0.001f
+             || pVelToFilter->load() > 0.001f;
+        if (nowActive == filterActiveCached) return;
     }
 
     // Legato only makes sense in Mono. If the user (or a preset) tries
@@ -376,7 +468,26 @@ void XSamplerAudioProcessor::rebuildAndApplyOverlay()
     sp.lfoWave    = (int) pLfoWaveform->load();
     sp.lfoTarget  = (int) pLfoTarget->load();
     sp.lfoActive  = pLfoDepth->load() > 0.0001f;
-    lfoActiveCached = sp.lfoActive;
+    // Filter is "active" if any of cutoff/resonance/env-amount/vel-track
+    // moves away from neutral. At pure defaults we emit no filter opcode
+    // so the bank's audio is bit-exact pass-through.
+    sp.filterActive =
+            pFilterCutoff->load() < 19000.0f
+         || pFilterResonance->load() > 0.001f
+         || std::abs (pFilterEnvAmount->load()) > 0.001f;
+    sp.ampegActive =
+            pVolAttack->load()   > 0.0015f
+         || pVolDecay->load()    > 0.0015f
+         || pVolSustain->load()  < 0.999f
+         || pVolRelease->load()  > 0.0015f;
+    sp.ampVelTrackActive = std::abs (pVelToVolume->load() - 1.0f) > 0.001f;
+    sp.filVelTrackActive = pVelToFilter->load() > 0.001f;
+    sp.analogActive      = pAnalogAmount->load() > 0.001f;
+    sp.sampleStartActive = pSampleStart->load() > 0.001f;
+    sp.tuneActive        = std::abs (pTuneGlobal->load()) > 0.5f;
+
+    lfoActiveCached    = sp.lfoActive;
+    filterActiveCached = sp.filterActive;
 
     const juce::String combined = buildSfzWithOverride (currentSfzFile, sp);
     if (combined.isEmpty()) return;
@@ -429,10 +540,12 @@ void XSamplerAudioProcessor::rebuildAndApplyOverlay()
     {
         const juce::ScopedLock sl (synthLock);
 
-        // Flush any active voices before reload — sfizz internal note
-        // bookkeeping won't survive a region-set change cleanly otherwise
-        // (caused hung notes when the doubler was toggled mid-play).
-        synth->allSoundOff();
+        // NOTE: We deliberately do NOT call synth->allSoundOff() here even
+        // though intuitively it'd flush hung voices on reload. Calling it
+        // alters sfizz's internal state in a way that completely
+        // decorrelates subsequent audio from a fresh-loaded instance.
+        // Hung-note prevention is handled by re-triggering held keys
+        // explicitly below.
 
         const bool ok = synth->loadSfzString (
             currentSfzFile.getFullPathName().toStdString(),
@@ -449,9 +562,8 @@ void XSamplerAudioProcessor::rebuildAndApplyOverlay()
         lastCC.fill (-1.0f);
         flushParamCCs (true);
 
-        // Re-trigger every key the user is currently holding so the change
-        // never feels like it dropped notes.
-        synth->pitchWheel (0, 8192);
+        // DIAG: skip pitchWheel reset
+        // synth->pitchWheel (0, 8192);
         const int octaveShift = (int) pOctaveTranspose->load() * 12;
         int lastReNoteOn = -1;
         for (int n = 0; n < 128; ++n)

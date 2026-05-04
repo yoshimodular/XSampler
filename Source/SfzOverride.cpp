@@ -31,9 +31,9 @@ namespace
     {
         switch (t)
         {
-            case 1: return "lfo01_cutoff_oncc";
-            case 2: return "lfo01_volume_oncc";
-            default: return "lfo01_pitch_oncc";
+            case 1: return "lfo99_cutoff_oncc";
+            case 2: return "lfo99_volume_oncc";
+            default: return "lfo99_pitch_oncc";
         }
     }
 
@@ -58,19 +58,21 @@ namespace
     //   * `pan`      — only stripped when our doubler wraps regions
     //   * `tune`     — kept; users rarely set per-region tune, and we
     //                   apply ours via tune_oncc on top of any existing.
-    const juce::StringArray& alwaysStripped()
-    {
-        static const juce::StringArray names {
-            "cutoff", "resonance", "fil_type",
-            "ampeg_attack", "ampeg_decay", "ampeg_sustain", "ampeg_release",
-            "fileg_attack", "fileg_decay", "fileg_sustain", "fileg_release", "fileg_depth",
-            "amp_veltrack", "fil_veltrack",
-            "polyphony",
-            "pitch_random", "delay_random",
-            "bend_up", "bend_down"
-        };
-        return names;
-    }
+    // Lists are now CONDITIONAL — applied only when the corresponding
+    // overlay section is active. This keeps audio bit-exact to vanilla
+    // when knobs are at their defaults.
+    juce::StringArray ampegStrip()      { return { "ampeg_attack", "ampeg_decay",
+                                                   "ampeg_sustain", "ampeg_release" }; }
+    juce::StringArray filterStrip()     { return { "cutoff", "resonance", "fil_type",
+                                                   "fileg_attack", "fileg_decay",
+                                                   "fileg_sustain", "fileg_release", "fileg_depth" }; }
+    juce::StringArray ampVelTrackStrip(){ return { "amp_veltrack" }; }
+    juce::StringArray filVelTrackStrip(){ return { "fil_veltrack" }; }
+    juce::StringArray analogStrip()     { return { "pitch_random", "delay_random" }; }
+    juce::StringArray sampleStartStrip(){ return { "offset" }; }
+    juce::StringArray tuneStrip()       { return { "tune" }; }
+    // Mono mode always strips polyphony when active.
+    juce::StringArray polyphonyStrip()  { return { "polyphony" }; }
 
     juce::String stripOpcode (const juce::String& text, const juce::String& name)
     {
@@ -80,9 +82,13 @@ namespace
         return juce::String (std::regex_replace (text.toStdString(), re, "$1"));
     }
 
-    juce::String stripLfoOpcodes (const juce::String& text)
+    // Strip ONLY our reserved LFO index (lfo99) from the user's source.
+    // The user's own lfo01..lfo32 (vibrato, tremolo, modulation routing)
+    // stays intact — many real-world banks rely on those for their
+    // character (the Aliexpress Erhu vibrato uses lfo01/03/05/06).
+    juce::String stripOurLfoOpcodes (const juce::String& text)
     {
-        const std::regex re ("(^|[\\s\\t])lfo[0-9]+_[a-z0-9_]*=\\S+",
+        const std::regex re ("(^|[\\s\\t])lfo99_[a-z0-9_]*=\\S+",
                              std::regex_constants::icase);
         return juce::String (std::regex_replace (text.toStdString(), re, "$1"));
     }
@@ -361,6 +367,62 @@ static juce::String injectIntoEveryGlobal (const juce::String& text,
     return out;
 }
 
+XSamplerSfzDefaults extractDefaults (const juce::File& originalSfz)
+{
+    XSamplerSfzDefaults out;
+    if (! originalSfz.existsAsFile()) return out;
+
+    // Inline includes so defaults from sub-files (e.g. erhu's common.sfz)
+    // are visible.
+    juce::String text = originalSfz.loadFileAsString();
+    {
+        std::unordered_set<std::string> stack;
+        stack.insert (originalSfz.getFullPathName().toStdString());
+        text = inlineIncludes (text, originalSfz, originalSfz, stack);
+    }
+
+    // For each opcode of interest, grab the first occurrence's value.
+    auto findFirst = [&text] (const char* name) -> juce::String
+    {
+        const std::regex re (
+            std::string ("(^|[\\s\\t])") + name + "=([^\\s\\r\\n]+)",
+            std::regex_constants::icase);
+        std::smatch m;
+        const std::string s = text.toStdString();
+        if (std::regex_search (s, m, re))
+            return juce::String (m[2].str());
+        return {};
+    };
+
+    auto floatVal = [&] (const char* name, float& out) {
+        auto v = findFirst (name);
+        if (v.isNotEmpty()) out = v.getFloatValue();
+    };
+
+    floatVal ("ampeg_attack",  out.ampegAttack);
+    floatVal ("ampeg_decay",   out.ampegDecay);
+    floatVal ("ampeg_sustain", out.ampegSustain);
+    floatVal ("ampeg_release", out.ampegRelease);
+    floatVal ("fileg_attack",  out.filegAttack);
+    floatVal ("fileg_decay",   out.filegDecay);
+    floatVal ("fileg_sustain", out.filegSustain);
+    floatVal ("fileg_release", out.filegRelease);
+    floatVal ("fileg_depth",   out.filegDepth);
+    floatVal ("cutoff",        out.cutoff);
+    floatVal ("resonance",     out.resonance);
+    floatVal ("amp_veltrack",  out.ampVelTrack);
+    floatVal ("fil_veltrack",  out.filVelTrack);
+
+    auto filTypeStr = findFirst ("fil_type");
+    if (filTypeStr.isNotEmpty())
+    {
+        if      (filTypeStr.startsWith ("lpf")) out.filType = 0;
+        else if (filTypeStr.startsWith ("hpf")) out.filType = 1;
+        else if (filTypeStr.startsWith ("bpf")) out.filType = 2;
+    }
+    return out;
+}
+
 juce::String buildSfzWithOverride (const juce::File& originalSfz,
                                    const XSamplerSfzParams& p)
 {
@@ -377,11 +439,20 @@ juce::String buildSfzWithOverride (const juce::File& originalSfz,
         original = inlineIncludes (original, originalSfz, originalSfz, pathStack);
     }
 
-    for (const auto& op : alwaysStripped())
-        original = stripOpcode (original, op);
-    original = stripLfoOpcodes (original);
+    auto stripList = [&] (const juce::StringArray& names) {
+        for (const auto& op : names) original = stripOpcode (original, op);
+    };
 
-    // Conditional strips
+    if (p.ampegActive)       stripList (ampegStrip());
+    if (p.filterActive)      stripList (filterStrip());
+    if (p.ampVelTrackActive) stripList (ampVelTrackStrip());
+    if (p.filVelTrackActive) stripList (filVelTrackStrip());
+    if (p.analogActive)      stripList (analogStrip());
+    if (p.sampleStartActive) stripList (sampleStartStrip());
+    if (p.tuneActive)        stripList (tuneStrip());
+    if (p.mono)              stripList (polyphonyStrip());
+    original = stripOurLfoOpcodes (original);
+
     if (p.legato && p.mono)
         original = stripOpcode (original, "trigger");
     if (p.doubler)
@@ -395,60 +466,57 @@ juce::String buildSfzWithOverride (const juce::File& originalSfz,
     if (p.mono)
         g << "polyphony=1\n";
 
-    // Internal pitch-bend range (24 semis fixed). The processor maps the
-    // user's pitchbend_range onto this.
-    g << "bend_up=2400\nbend_down=-2400\n";
+    if (p.tuneActive)
+        g << "tune=-100\n"
+          << "tune_oncc" << XSamplerCC::Tune << "=200\n";
 
-    // Tune: declared as additive only — no base value, so any per-region
-    // user tune wins. CC110 sends 0..1 mapped to -100..+100 c.
-    g << "tune_oncc"     << XSamplerCC::Tune       << "=200\n";
-    g << "tune_curvecc"  << XSamplerCC::Tune       << "=2\n";  // bipolar curve
+    if (p.filterActive)
+    {
+        g << "bend_up=2400\nbend_down=-2400\n";  // wider bend if filter active
+        g << "fil_type="     << sfzFilterType (p.filterType) << "\n"
+          << "cutoff=20\n"
+          << "cutoff_oncc"   << XSamplerCC::Cutoff     << "=12000\n"
+          << "resonance=0\n"
+          << "resonance_oncc"<< XSamplerCC::Resonance  << "=24\n"
+          << "fileg_attack=0\n"  << "fileg_attack_oncc"  << XSamplerCC::FltAttack  << "=10\n"
+          << "fileg_decay=0\n"   << "fileg_decay_oncc"   << XSamplerCC::FltDecay   << "=10\n"
+          << "fileg_sustain=0\n" << "fileg_sustain_oncc" << XSamplerCC::FltSustain << "=100\n"
+          << "fileg_release=0\n" << "fileg_release_oncc" << XSamplerCC::FltRelease << "=20\n"
+          << "fileg_depth=-4800\n"
+          << "fileg_depth_oncc"  << XSamplerCC::FltEnvAmount << "=9600\n";
+    }
 
-    // Filter
-    g << "fil_type="     << sfzFilterType (p.filterType) << "\n";
-    g << "cutoff=20\n"
-      << "cutoff_oncc"   << XSamplerCC::Cutoff     << "=12000\n"
-      << "resonance=0\n"
-      << "resonance_oncc"<< XSamplerCC::Resonance  << "=24\n";
+    if (p.ampegActive)
+        g << "ampeg_attack=0\n"  << "ampeg_attack_oncc"  << XSamplerCC::VolAttack  << "=10\n"
+          << "ampeg_decay=0\n"   << "ampeg_decay_oncc"   << XSamplerCC::VolDecay   << "=10\n"
+          << "ampeg_sustain=0\n" << "ampeg_sustain_oncc" << XSamplerCC::VolSustain << "=100\n"
+          << "ampeg_release=0\n" << "ampeg_release_oncc" << XSamplerCC::VolRelease << "=20\n";
 
-    // Volume ADSR
-    g << "ampeg_attack=0\n"   << "ampeg_attack_oncc"  << XSamplerCC::VolAttack  << "=10\n"
-      << "ampeg_decay=0\n"    << "ampeg_decay_oncc"   << XSamplerCC::VolDecay   << "=10\n"
-      << "ampeg_sustain=0\n"  << "ampeg_sustain_oncc" << XSamplerCC::VolSustain << "=100\n"
-      << "ampeg_release=0\n"  << "ampeg_release_oncc" << XSamplerCC::VolRelease << "=20\n";
-
-    // Filter ADSR
-    g << "fileg_attack=0\n"   << "fileg_attack_oncc"  << XSamplerCC::FltAttack  << "=10\n"
-      << "fileg_decay=0\n"    << "fileg_decay_oncc"   << XSamplerCC::FltDecay   << "=10\n"
-      << "fileg_sustain=0\n"  << "fileg_sustain_oncc" << XSamplerCC::FltSustain << "=100\n"
-      << "fileg_release=0\n"  << "fileg_release_oncc" << XSamplerCC::FltRelease << "=20\n"
-      << "fileg_depth=-4800\n"
-      << "fileg_depth_oncc"   << XSamplerCC::FltEnvAmount << "=9600\n";
-
-    // LFO
     if (p.lfoActive)
     {
-        g << "lfo01_freq=0\n"
-          << "lfo01_freq_oncc"  << XSamplerCC::LfoRate << "=20\n"
-          << "lfo01_delay=0\n"
-          << "lfo01_delay_oncc" << XSamplerCC::LfoDelay << "=4\n"
-          << "lfo01_wave="      << sfzLfoWave (p.lfoWave) << "\n"
+        g << "lfo99_freq=0\n"
+          << "lfo99_freq_oncc"  << XSamplerCC::LfoRate << "=20\n"
+          << "lfo99_delay=0\n"
+          << "lfo99_delay_oncc" << XSamplerCC::LfoDelay << "=4\n"
+          << "lfo99_wave="      << sfzLfoWave (p.lfoWave) << "\n"
           << lfoTargetOpcode (p.lfoTarget)
           << XSamplerCC::LfoDepth << "="
           << lfoTargetMaxDepth (p.lfoTarget) << "\n";
     }
 
-    // Velocity tracking (additive — user's region values still win as the
-    // base; our CC modulation rides on top).
-    g << "amp_veltrack_oncc" << XSamplerCC::AmpVelTrack << "=100\n"
-      << "fil_veltrack_oncc" << XSamplerCC::FilVelTrack << "=4800\n";
+    if (p.ampVelTrackActive)
+        g << "amp_veltrack=0\n"
+          << "amp_veltrack_oncc" << XSamplerCC::AmpVelTrack << "=100\n";
+    if (p.filVelTrackActive)
+        g << "fil_veltrack=0\n"
+          << "fil_veltrack_oncc" << XSamplerCC::FilVelTrack << "=4800\n";
 
-    // Analog (random pitch + delay) — additive on top of any user values.
-    g << "pitch_random_oncc" << XSamplerCC::PitchRandom << "=10\n"
-      << "delay_random_oncc" << XSamplerCC::DelayRandom << "=0.003\n";
+    if (p.analogActive)
+        g << "pitch_random_oncc" << XSamplerCC::PitchRandom << "=10\n"
+          << "delay_random_oncc" << XSamplerCC::DelayRandom << "=0.003\n";
 
-    // Sample start — additive on top of user offsets.
-    g << "offset_oncc" << XSamplerCC::SampleStart << "=4410\n";
+    if (p.sampleStartActive)
+        g << "offset_oncc" << XSamplerCC::SampleStart << "=4410\n";
 
     g << "\n";
 
