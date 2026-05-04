@@ -1064,6 +1064,172 @@ struct PortamentoTests : public juce::UnitTest
 };
 
 //==============================================================================
+// Loads many real-world SFZs and verifies they all parse, play, and never
+// hang. Walks sfizz's bundled test files (parser-edge-case-rich) plus any
+// banks staged into TestBanks/ (Steel Drum, Erhu, ...).
+struct SfzCompatibilityTests : public juce::UnitTest
+{
+    SfzCompatibilityTests() : juce::UnitTest ("SFZ compatibility (real banks)", "XSampler") {}
+
+    static void scan (const juce::File& dir, juce::Array<juce::File>& out)
+    {
+        if (! dir.isDirectory()) return;
+        for (auto& f : juce::RangedDirectoryIterator (dir, true, "*.sfz",
+                                                       juce::File::findFiles))
+            out.add (f.getFile());
+    }
+
+    struct Outcome { bool loaded { false }; bool produced { false }; float peak { 0.0f }; };
+
+    static Outcome stress (XSamplerAudioProcessor& p, const juce::File& sfz)
+    {
+        Outcome o;
+        if (! p.loadSfzFile (sfz)) return o;
+        o.loaded = true;
+
+        // Try a fan of MIDI notes spanning a wide range — the SFZ may map
+        // only a few keys, but we want to know that *some* of them sound.
+        const int notes[] = { 36, 48, 60, 64, 67, 72, 84 };
+
+        juce::AudioBuffer<float> blk (2, kBlock);
+        for (int n : notes)
+        {
+            juce::MidiBuffer all;
+            all.addEvent (juce::MidiMessage::allNotesOff (1), 0);
+            for (int b = 0; b < 2; ++b)
+            {
+                blk.clear();
+                p.processBlock (blk, all);
+                all.clear();
+            }
+            juce::MidiBuffer m;
+            m.addEvent (juce::MidiMessage::noteOn (1, n, (juce::uint8) 100), 0);
+            // Render up to ~600 ms so streaming samples have a chance to start.
+            for (int b = 0; b < 100; ++b)
+            {
+                blk.clear();
+                p.processBlock (blk, m);
+                m.clear();
+                for (int ch = 0; ch < 2; ++ch)
+                    for (int i = 0; i < kBlock; ++i)
+                    {
+                        const float v = blk.getReadPointer (ch)[i];
+                        // Hard fail: NaN/Inf would propagate to the host.
+                        if (! std::isfinite (v)) { o.produced = false; o.peak = -1.0f; return o; }
+                        o.peak = std::max (o.peak, std::abs (v));
+                    }
+            }
+        }
+        if (o.peak > 1.0e-4f) o.produced = true;
+        return o;
+    }
+
+    void runTest() override
+    {
+        juce::Array<juce::File> sfzFiles;
+
+        // sfizz's bundled test SFZs (always present after FetchContent).
+        const juce::File sfizzTests {
+            juce::File::getCurrentWorkingDirectory()
+                .getChildFile ("../build/_deps/sfizz-src/tests/TestFiles") };
+        scan (sfizzTests, sfzFiles);
+        // also try absolute path (when test is run from project root)
+        scan (juce::File ("/Users/capitalsound/Library/Mobile Documents/com~apple~CloudDocs/Code/XSampler/build/_deps/sfizz-src/tests/TestFiles"), sfzFiles);
+
+        // Real banks staged under TestBanks/.
+        scan (juce::File ("/Users/capitalsound/Library/Mobile Documents/com~apple~CloudDocs/Code/XSampler/TestBanks"), sfzFiles);
+
+        sfzFiles.removeIf ([] (const juce::File& f) { return ! f.existsAsFile(); });
+        // De-dup
+        juce::StringArray seen;
+        sfzFiles.removeIf ([&] (const juce::File& f) {
+            if (seen.contains (f.getFullPathName())) return true;
+            seen.add (f.getFullPathName());
+            return false;
+        });
+
+        beginTest ("Found at least one SFZ to test");
+        logMessage ("Discovered " + juce::String (sfzFiles.size()) + " SFZ files");
+        if (sfzFiles.isEmpty()) { logMessage ("SKIPPING — no SFZ files"); return; }
+
+        beginTest ("Every SFZ loads without crashing the engine");
+        int loadedCount = 0, audibleCount = 0, totalCount = sfzFiles.size();
+        juce::StringArray failedLoad, silent;
+
+        for (auto& f : sfzFiles)
+        {
+            // Fresh processor per file: rebuild listener / heldNoteVel state
+            // is per-instance and we want isolation between SFZs.
+            auto p = makePrepared();
+            const auto rel = f.getFileName();
+
+            const Outcome o = stress (*p, f);
+            if (o.peak < 0)
+            {
+                expect (false, "Non-finite audio while playing " + rel);
+                continue;
+            }
+            if (! o.loaded)
+            {
+                failedLoad.add (rel);
+                continue;
+            }
+            ++loadedCount;
+            if (! o.produced)
+                silent.add (rel + " (peak=" + juce::String (o.peak, 6) + ")");
+            else
+                ++audibleCount;
+        }
+
+        logMessage ("Loaded:   " + juce::String (loadedCount)  + " / " + juce::String (totalCount));
+        logMessage ("Audible:  " + juce::String (audibleCount) + " / " + juce::String (totalCount));
+        if (! failedLoad.isEmpty())
+            logMessage ("Failed to load (" + juce::String (failedLoad.size()) + "): "
+                        + failedLoad.joinIntoString (", "));
+        if (! silent.isEmpty() && silent.size() < 30)
+            logMessage ("Loaded but silent: " + silent.joinIntoString (", "));
+
+        // The bundled tests deliberately include some that won't make
+        // sound (controller test files, scenario stubs). What we can't
+        // tolerate is an outright load failure on a well-formed SFZ.
+        // Lower bound: at least 60 % of SFZs we found should load.
+        expect (loadedCount * 5 >= totalCount * 3,
+                "Too many SFZs failed to load — possible parser regression");
+        // And at least 25 % should make audible sound.
+        expect (audibleCount * 4 >= totalCount,
+                "Suspiciously few SFZs made audible sound");
+
+        // -----------------------------------------------------------------
+        // Targeted top-level instruments — the things a user would
+        // actually open. ALL of these MUST be audible. If any of them
+        // fails, sample linking has regressed.
+        beginTest ("Top-level real-world instruments are audible");
+        const juce::File topLevels[] = {
+            juce::File ("/Users/capitalsound/Library/Mobile Documents/com~apple~CloudDocs/Code/XSampler/SFZ/Resonant2.sfz"),
+            juce::File ("/Users/capitalsound/Library/Mobile Documents/com~apple~CloudDocs/Code/XSampler/TestBanks/erhu/Programs/02-erhu_long.sfz"),
+            juce::File ("/Users/capitalsound/Library/Mobile Documents/com~apple~CloudDocs/Code/XSampler/TestBanks/erhu/Programs/03-erhu_short.sfz"),
+            juce::File ("/Users/capitalsound/Library/Mobile Documents/com~apple~CloudDocs/Code/XSampler/TestBanks/erhu/Programs/04-erhu_marcato.sfz"),
+            juce::File ("/Users/capitalsound/Library/Mobile Documents/com~apple~CloudDocs/Code/XSampler/TestBanks/steeldrum/_jSteelDrum-flac.sfz"),
+        };
+        for (const auto& f : topLevels)
+        {
+            if (! f.existsAsFile())
+            {
+                logMessage ("SKIP (not present): " + f.getFileName());
+                continue;
+            }
+            auto p = makePrepared();
+            const auto o = stress (*p, f);
+            logMessage (f.getFileName() + "  loaded=" + juce::String ((int) o.loaded)
+                        + "  audible=" + juce::String ((int) o.produced)
+                        + "  peak=" + juce::String (o.peak, 5));
+            expect (o.loaded,   f.getFileName() + " — must load");
+            expect (o.produced, f.getFileName() + " — must produce audible audio");
+        }
+    }
+};
+
+//==============================================================================
 struct EditorTests : public juce::UnitTest
 {
     EditorTests() : juce::UnitTest ("Editor lifecycle", "XSampler") {}
@@ -1096,6 +1262,7 @@ static SmoothParamTests     _t_smooth;
 static MonoModeTests        _t_mono;
 static StructuralRebuildHoldNotesTest _t_rebuildHold;
 static PortamentoTests      _t_porta;
+static SfzCompatibilityTests _t_compat;
 static EditorTests          _t_editor;
 
 int main (int, char**)

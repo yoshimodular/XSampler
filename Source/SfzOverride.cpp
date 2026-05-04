@@ -40,22 +40,32 @@ namespace
     {
         switch (t)
         {
-            case 1: return 4800; // cents on cutoff
-            case 2: return 24;   // dB on volume
-            default: return 1200; // cents on pitch
+            case 1: return 4800;
+            case 2: return 24;
+            default: return 1200;
         }
     }
 
-    const juce::StringArray& strippedOpcodes()
+    // Opcodes we ALWAYS strip from the user's source — they're mapped to
+    // a macro knob and stripping is essential so per-region values don't
+    // shadow our <global> CC routing.
+    //
+    // We deliberately DO NOT strip these (they're often authored
+    // intentionally and we don't necessarily replace them):
+    //   * `trigger`  — only stripped when our own legato wraps regions
+    //   * `offset`   — user's deliberate offsets stay; our CC adds on top
+    //   * `pan`      — only stripped when our doubler wraps regions
+    //   * `tune`     — kept; users rarely set per-region tune, and we
+    //                   apply ours via tune_oncc on top of any existing.
+    const juce::StringArray& alwaysStripped()
     {
         static const juce::StringArray names {
             "cutoff", "resonance", "fil_type",
             "ampeg_attack", "ampeg_decay", "ampeg_sustain", "ampeg_release",
             "fileg_attack", "fileg_decay", "fileg_sustain", "fileg_release", "fileg_depth",
             "amp_veltrack", "fil_veltrack",
-            "tune", "polyphony", "trigger",
+            "polyphony",
             "pitch_random", "delay_random",
-            "offset", "pan",
             "bend_up", "bend_down"
         };
         return names;
@@ -76,12 +86,25 @@ namespace
         return juce::String (std::regex_replace (text.toStdString(), re, "$1"));
     }
 
-    // Returns the offset of the first SFZ section header (`<region>`,
-    // `<group>`, `<master>`, `<control>`) in `text`, or -1 if none.
-    int firstSectionHeaderOffset (const juce::String& text)
+    // Index of the first SFZ region/group/master/global header (NOT control).
+    // Our overlay's <global> block is prepended here so any `<control>` that
+    // the user authored at the top of the file stays in the preamble where
+    // sfizz expects it.
+    int firstNonControlHeader (const juce::String& text)
     {
         int best = -1;
-        for (auto h : { "<region>", "<group>", "<master>", "<control>" })
+        for (auto h : { "<region>", "<group>", "<master>", "<global>" })
+        {
+            int idx = text.indexOf (h);
+            if (idx >= 0 && (best < 0 || idx < best)) best = idx;
+        }
+        return best;
+    }
+
+    int firstRegionHeader (const juce::String& text)
+    {
+        int best = -1;
+        for (auto h : { "<region>", "<group>", "<master>" })
         {
             int idx = text.indexOf (h);
             if (idx >= 0 && (best < 0 || idx < best)) best = idx;
@@ -97,10 +120,18 @@ juce::String buildSfzWithOverride (const juce::File& originalSfz,
         return {};
 
     juce::String original = originalSfz.loadFileAsString();
-    for (const auto& op : strippedOpcodes())
+
+    for (const auto& op : alwaysStripped())
         original = stripOpcode (original, op);
     original = stripLfoOpcodes (original);
 
+    // Conditional strips
+    if (p.legato && p.mono)
+        original = stripOpcode (original, "trigger");
+    if (p.doubler)
+        original = stripOpcode (original, "pan");
+
+    // Build our <global> block.
     juce::String g;
     g << "// XSampler runtime overlay — generated, do not edit\n";
     g << "<global>\n";
@@ -108,18 +139,18 @@ juce::String buildSfzWithOverride (const juce::File& originalSfz,
     if (p.mono)
         g << "polyphony=1\n";
 
-    // Fixed wide internal pitch-bend range (24 semis). Our processor
-    // maps the user's `pitchbend_range` onto this so a single rebuild
-    // covers any user setting without overlay rework.
+    // Internal pitch-bend range (24 semis fixed). The processor maps the
+    // user's pitchbend_range onto this.
     g << "bend_up=2400\nbend_down=-2400\n";
 
-    // Tune (CC110: -100..+100 c)
-    g << "tune=-100\n"
-      << "tune_oncc"     << XSamplerCC::Tune       << "=200\n";
+    // Tune: declared as additive only — no base value, so any per-region
+    // user tune wins. CC110 sends 0..1 mapped to -100..+100 c.
+    g << "tune_oncc"     << XSamplerCC::Tune       << "=200\n";
+    g << "tune_curvecc"  << XSamplerCC::Tune       << "=2\n";  // bipolar curve
 
     // Filter
-    g << "fil_type="     << sfzFilterType (p.filterType) << "\n"
-      << "cutoff=20\n"
+    g << "fil_type="     << sfzFilterType (p.filterType) << "\n";
+    g << "cutoff=20\n"
       << "cutoff_oncc"   << XSamplerCC::Cutoff     << "=12000\n"
       << "resonance=0\n"
       << "resonance_oncc"<< XSamplerCC::Resonance  << "=24\n";
@@ -130,9 +161,7 @@ juce::String buildSfzWithOverride (const juce::File& originalSfz,
       << "ampeg_sustain=0\n"  << "ampeg_sustain_oncc" << XSamplerCC::VolSustain << "=100\n"
       << "ampeg_release=0\n"  << "ampeg_release_oncc" << XSamplerCC::VolRelease << "=20\n";
 
-    // Filter ADSR + bipolar env amount via CC104.
-    // Base depth = -4800 c, CC104 modulates ±9600 c so 0.5 = no modulation,
-    // 0.0 = -4800 c (env darkens), 1.0 = +4800 c (env brightens).
+    // Filter ADSR
     g << "fileg_attack=0\n"   << "fileg_attack_oncc"  << XSamplerCC::FltAttack  << "=10\n"
       << "fileg_decay=0\n"    << "fileg_decay_oncc"   << XSamplerCC::FltDecay   << "=10\n"
       << "fileg_sustain=0\n"  << "fileg_sustain_oncc" << XSamplerCC::FltSustain << "=100\n"
@@ -140,8 +169,7 @@ juce::String buildSfzWithOverride (const juce::File& originalSfz,
       << "fileg_depth=-4800\n"
       << "fileg_depth_oncc"   << XSamplerCC::FltEnvAmount << "=9600\n";
 
-    // LFO 1 — only declared when depth > 0 (sfizz silences output if LFO
-    // is declared with all-zero modulation depths).
+    // LFO
     if (p.lfoActive)
     {
         g << "lfo01_freq=0\n"
@@ -154,79 +182,81 @@ juce::String buildSfzWithOverride (const juce::File& originalSfz,
           << lfoTargetMaxDepth (p.lfoTarget) << "\n";
     }
 
-    // Velocity tracking
-    g << "amp_veltrack=0\n" << "amp_veltrack_oncc" << XSamplerCC::AmpVelTrack << "=100\n"
-      << "fil_veltrack=0\n" << "fil_veltrack_oncc" << XSamplerCC::FilVelTrack << "=4800\n";
+    // Velocity tracking (additive — user's region values still win as the
+    // base; our CC modulation rides on top).
+    g << "amp_veltrack_oncc" << XSamplerCC::AmpVelTrack << "=100\n"
+      << "fil_veltrack_oncc" << XSamplerCC::FilVelTrack << "=4800\n";
 
-    // Analog: subtle pitch + delay randomisation per voice. Maxes are
-    // tuned for "old analog synth" behaviour, not glitch.
-    g << "pitch_random=0\n" << "pitch_random_oncc" << XSamplerCC::PitchRandom << "=10\n"
-      << "delay_random=0\n" << "delay_random_oncc" << XSamplerCC::DelayRandom << "=0.003\n";
+    // Analog (random pitch + delay) — additive on top of any user values.
+    g << "pitch_random_oncc" << XSamplerCC::PitchRandom << "=10\n"
+      << "delay_random_oncc" << XSamplerCC::DelayRandom << "=0.003\n";
 
-    // Sample start (offset in samples). 4410 ≈ 100 ms at 44.1k. Smaller
-    // than v0.0.6 so it stays inside the body of short percussive samples;
-    // SFZ has no relative offset, so this is a per-sample compromise.
-    g << "offset=0\n"
-      << "offset_oncc" << XSamplerCC::SampleStart << "=4410\n";
+    // Sample start — additive on top of user offsets.
+    g << "offset_oncc" << XSamplerCC::SampleStart << "=4410\n";
 
     g << "\n";
 
-    // -------- Region body ----------------------------------------------
-    if (p.legato && p.mono)
+    // -------- Splice the overlay into the right place ------------------
+    // If the user's file has a `<control>` block, our <global> goes AFTER
+    // it (control must come before global per SFZ spec). Otherwise it
+    // goes at the top.
+    const int hdrPos = firstNonControlHeader (original);
+
+    juce::String preamble, body;
+    if (hdrPos >= 0)
     {
-        // Legato: keep polyphony=1 (mono) and emit two region copies —
-        // one with trigger=first (the very first key) and one with
-        // trigger=legato (subsequent overlapping keys, which inherit
-        // the active envelope).
-        const int splitAt = firstSectionHeaderOffset (original);
-        if (splitAt < 0)
-        {
-            g << "trigger=legato\n" << original;
-        }
-        else
-        {
-            const juce::String preamble = original.substring (0, splitAt);
-            const juce::String body     = original.substring (splitAt);
-            g << preamble;
-            g << "<group>\ntrigger=first\n"  << body << "\n";
-            g << "<group>\ntrigger=legato\n" << body << "\n";
-        }
-    }
-    else if (! p.doubler)
-    {
-        g << original;
+        preamble = original.substring (0, hdrPos);
+        body     = original.substring (hdrPos);
     }
     else
     {
-        // Doubler mode: split the original at the first section header and
-        // emit two copies with hard-panned <group> wrappers and opposite
-        // detune offsets via CC100. The user's analog-amount knob drives
-        // CC100 — we re-purpose pitch_random_oncc as the detune knob, but
-        // the per-group `tune_oncc100` adds a deterministic ±detune so the
-        // two voices diverge predictably. Result: classic L/R doubling
-        // without per-voice plumbing.
-        const int splitAt = firstSectionHeaderOffset (original);
-        if (splitAt < 0)
+        preamble = original;
+        body     = juce::String();
+    }
+
+    juce::String out;
+
+    // Doubler / legato need the region body duplicated. For simple modes
+    // we just stitch [preamble] + [our overlay] + [body].
+    if (p.legato && p.mono)
+    {
+        const int rPos = firstRegionHeader (body);
+        if (rPos < 0)
         {
-            g << original;
+            out << preamble << g << "trigger=legato\n" << body;
         }
         else
         {
-            const juce::String preamble = original.substring (0, splitAt);
-            const juce::String body     = original.substring (splitAt);
-
-            g << preamble;
-            g << "<group>\n"
-              << "pan=-100\n"
-              << "tune_oncc" << XSamplerCC::PitchRandom << "=-25\n"
-              << body << "\n";
-            g << "<group>\n"
-              << "pan=100\n"
-              << "tune_oncc" << XSamplerCC::PitchRandom << "=25\n"
-              << "delay_oncc" << XSamplerCC::DelayRandom << "=0.005\n"
-              << body << "\n";
+            const juce::String beforeRegions = body.substring (0, rPos);
+            const juce::String regionBlock   = body.substring (rPos);
+            out << preamble << g << beforeRegions
+                << "<group>\ntrigger=first\n"  << regionBlock << "\n"
+                << "<group>\ntrigger=legato\n" << regionBlock << "\n";
         }
     }
+    else if (p.doubler)
+    {
+        const int rPos = firstRegionHeader (body);
+        if (rPos < 0)
+        {
+            out << preamble << g << body;
+        }
+        else
+        {
+            const juce::String beforeRegions = body.substring (0, rPos);
+            const juce::String regionBlock   = body.substring (rPos);
+            out << preamble << g << beforeRegions
+                << "<group>\npan=-100\ntune_oncc"  << XSamplerCC::PitchRandom << "=-25\n"
+                << regionBlock << "\n"
+                << "<group>\npan=100\ntune_oncc"   << XSamplerCC::PitchRandom << "=25\n"
+                << "delay_oncc"                    << XSamplerCC::DelayRandom << "=0.005\n"
+                << regionBlock << "\n";
+        }
+    }
+    else
+    {
+        out << preamble << g << body;
+    }
 
-    return g;
+    return out;
 }

@@ -293,9 +293,29 @@ void XSamplerAudioProcessor::parameterChanged (const juce::String& id, float new
 {
     if (id == ParamID::lfoDepth)
     {
-        // Rebuild only when the LFO's active state crosses the zero boundary.
         const bool nowActive = newValue > 0.0001f;
         if (nowActive == lfoActiveCached) return;
+    }
+
+    // Legato only makes sense in Mono. If the user (or a preset) tries
+    // to enable it while in Poly, snap it straight back to OFF.
+    if (id == ParamID::legatoEnabled && newValue >= 0.5f)
+    {
+        const bool mono = pVoiceMode != nullptr && pVoiceMode->load() >= 0.5f;
+        if (! mono)
+        {
+            if (auto* prm = apvts.getParameter (ParamID::legatoEnabled))
+                prm->setValueNotifyingHost (0.0f);
+            return; // don't propagate as a structural change
+        }
+    }
+
+    // Switching back to Poly forces legato off so the gate stays consistent.
+    if (id == ParamID::voiceMode && newValue < 0.5f) // Poly
+    {
+        if (auto* prm = apvts.getParameter (ParamID::legatoEnabled))
+            if (prm->getValue() >= 0.5f)
+                prm->setValueNotifyingHost (0.0f);
     }
 
     overlayDirty.store (true, std::memory_order_release);
